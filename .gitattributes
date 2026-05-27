@@ -1,0 +1,23 @@
+# Normalize line endings. Source/text files are stored LF in the repo;
+# Windows checkouts get native CRLF only where it matters for tooling.
+* text=auto eol=lf
+
+# Shell scripts and Unix-origin build files must stay LF.
+build      text eol=lf
+configure  text eol=lf
+clean      text eol=lf
+install    text eol=lf
+*.sh       text eol=lf
+
+# C/C++ sources stay LF for cross-platform consistency.
+*.c    text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+
+# Treat sample data and fonts as binary (no EOL munging, exact bytes preserved
+# so regression hashes are stable).
+*.az   binary
+*.el   binary
+*.scf  binary
+*.gz   binary
+sample_data/sdf/** binary
