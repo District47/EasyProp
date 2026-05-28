@@ -260,11 +260,33 @@ function Invoke-SplatCompute {
         if (Test-Path $p) { Remove-Item $p -Force }
     }
 
+    # SPLAT! flag choice -- this is the key bit that makes power/freq actually
+    # matter:
+    #   -c X  is LOS-only coverage with RX antenna at X meters AGL. Purely
+    #         geometric: where the TX can physically be seen over the terrain.
+    #         Doesn't look at the .lrp at all. Same result for 1W and 1MW.
+    #   -L X  is path-loss / signal-strength map with RX antenna at X meters
+    #         AGL. Runs ITWOM with the .lrp's frequency, ERP, climate, etc.
+    #         and emits colored contours of actual signal strength. THIS is
+    #         the mode that reflects the form's band/power/antenna inputs.
+    #   -dbm  switches the contour color bands from field strength
+    #         (dB-microV/m) to dBm (the more intuitive "-80 = weak,
+    #         -60 = strong" radio scale).
+    #   -R K  sets the analysis radius (kilometers when -metric is on, miles
+    #         otherwise). The form takes miles for familiarity, so convert.
+    #
+    # RX antenna height is hard-coded at 2 m (typical handheld receiver). A
+    # future form field could let the user pick a different RX.
+    $rxHeightM = 2.0
+    $rangeKm   = [math]::Round($Req.range_mi * 1.609344, 2)
+
     $splatSw = [System.Diagnostics.Stopwatch]::StartNew()
     $stdout = Join-Path $serveDir 'splat.stdout.txt'
     $stderr = Join-Path $serveDir 'splat.stderr.txt'
-    $argList = @('-d', $SdfDir, '-t', "$name.qth", '-c', "$($Req.range_mi)",
-                 '-metric', '-geo', '-o', "$name.png")
+    $argList = @('-d', $SdfDir, '-t', "$name.qth",
+                 '-L', "$rxHeightM",
+                 '-R', "$rangeKm",
+                 '-dbm', '-metric', '-geo', '-o', "$name.png")
     $proc = Start-Process -FilePath $SplatHdExe -ArgumentList $argList `
               -WorkingDirectory $serveDir -NoNewWindow -Wait -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
