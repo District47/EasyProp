@@ -6,8 +6,17 @@ real-terrain RF propagation appear on top of an OpenStreetMap basemap.
 
 ![Interactive viewer with the WNJU-DT reference overlay](screenshots/interactive-form.png)
 
+![Auto-fetch in action: clicked Vineland NJ, server fetched the 6 missing SRTM tiles, real terrain everywhere](screenshots/auto-fetch-vineland.png)
+
+*Click anywhere — the server figures out which SRTM tiles SPLAT! HD will iterate over, fetches the missing ones from the AWS Mapzen Skadi mirror, runs the propagation analysis, and you see terrain-shaped coverage. No pre-staging required.*
+
 ## What you get
 
+- **Click anywhere** — the server auto-fetches whatever SRTM tiles
+  SPLAT! HD will need for the analysis (a 3×3-tile grid around the TX,
+  matching MAXPAGES=9's `deg_limit=1.0°`). First click in a new region
+  takes ~4 min (download + convert 6–9 tiles, sequential); subsequent
+  clicks in the same area reuse the cached tiles and run in ~2 min.
 - **Click-to-place TX** — a single click drops a draggable pin; lat/lon
   fill in automatically. Re-drag the pin to re-place.
 - **Band presets** — FRS, GMRS, MURS, 2 m / 70 cm amateur, UHF TV, custom.
@@ -45,13 +54,17 @@ Then in the browser:
    ITWOM run over real SRTM elevation), the new coverage overlay
    replaces the previous one in place.
 
-Constraints:
-- You need SRTM SDF tiles covering wherever you click. The viewer doesn't
-  fetch on demand yet — see [utils/fetch_srtm.ps1](../utils/fetch_srtm.ps1)
-  to pre-stage a region.
-- Compute time scales with the analysis region. The HD build with
-  `MAXPAGES=4` covers up to 2°×2° (~7200×7200 px image); a 30-mile
-  coverage run inside that takes roughly 30–60 s on a modern desktop.
+Pre-staging is optional now — the server auto-fetches missing tiles
+through [utils/fetch_srtm.ps1](../utils/fetch_srtm.ps1), which tries the
+AWS Mapzen Skadi mirror first (no auth, gzipped raw .hgt, complete
+coverage) and falls back to ESA SRTMGL1. Tiles are cached in `-SdfDir`
+after the first run.
+
+Compute time, roughly:
+- HD with `MAXPAGES=9` (default): rendered image is 10800×10800 = 3°×3°,
+  splat-hd takes ~110–130 s; first click in a new region adds ~4 min for
+  the 6–9 tile fetch+convert sequence.
+- Subsequent clicks in cached regions: 0.1 s fetch + ~2 min splat.
 
 ## One-time setup
 

@@ -43,6 +43,15 @@ param(
     [string]$SourceDir  = ".",
     [string]$SdfDir     = "",
     [string]$SplatHdExe = "C:\splat-build-hd\Release\splat-hd.exe",
+    [string]$SrtmTool   = "C:\splat-build\utils\Release\srtm2sdf-hd.exe",
+    # deg_limit from splat.cpp main()'s switch(MAXPAGES). For an HD build
+    # with MAXPAGES=9, splat caps its analysis half-width at 1.0 degrees
+    # in both lat and lon, meaning it loads (and sea-level-fills) a 3x3
+    # tile grid around any TX. Match that here so auto-fetch covers the
+    # whole rendered image, not just the user's coverage radius.
+    #   MAXPAGES = 1, 4, 9, 16, 25, 36, 49, 64
+    #   deg_limit= 0.125, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5
+    [double]$DegLimit = 1.0,
     [int]$Port = 8765,
     [switch]$NoBrowser
 )
@@ -135,9 +144,107 @@ $($erp.ToString('F2'))     ; ERP in Watts (from $Watts W TX + $GainDbi dBi anten
     [System.IO.File]::WriteAllText($Path, $body, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Get-RequiredTiles {
+    # Returns the list of integer-degree HGT SW-corner pairs that SPLAT! HD
+    # will iterate over when analyzing a TX at (Lat, LonStd).
+    #
+    # SPLAT! caps its analysis half-width at deg_limit (from MAXPAGES; see
+    # the -DegLimit param above). The user's -c RangeMi only determines the
+    # SHAPE of the coverage flood-fill -- the IMAGE that gets rendered always
+    # spans (lat +/- deg_limit) x (lon +/- deg_limit), with any unloaded
+    # tiles in that bbox sea-level-filled (the blue rectangle you'd
+    # otherwise see). So we fetch the full deg_limit bbox.
+    #
+    # HGT naming: file N<LAT>W<WEST> covers latitudes [LAT, LAT+1] and west
+    # longitudes [WEST-1, WEST]. The integer SW corners that intersect
+    # [lat +/- deg, west +/- deg] are:
+    #
+    #     sw_lat in [floor(lat_min), floor(lat_max)]
+    #     sw_w   in [floor(w_min)+1, floor(w_max)+1]
+    #
+    # (Slightly conservative on tile boundaries -- harmless: the fetcher's
+    # already-cached check / 404 absorbs any extra.)
+    #
+    param([double]$Lat, [double]$LonStd, [double]$RangeMi, [double]$DegLimit)
+    # Take the SMALLER of the user's coverage radius and splat's deg_limit;
+    # splat itself does the same min() inside main().
+    $degRange = $RangeMi / 69.0
+    if ($degRange -gt $DegLimit) { $degRange = $DegLimit }
+    # In practice deg_limit dominates for the typical small handheld ranges,
+    # so we expand back to it so the rendered image isn't a blue rectangle
+    # around real terrain near the TX.
+    if ($degRange -lt $DegLimit) { $degRange = $DegLimit }
+    $west = -1.0 * $LonStd
+
+    $latLo = [int][math]::Floor($Lat  - $degRange)
+    $latHi = [int][math]::Floor($Lat  + $degRange)
+    $wLo   = [int][math]::Floor($west - $degRange) + 1
+    $wHi   = [int][math]::Floor($west + $degRange) + 1
+
+    $tiles = New-Object System.Collections.Generic.List[object]
+    for ($la = $latLo; $la -le $latHi; $la++) {
+        for ($w = $wLo; $w -le $wHi; $w++) {
+            $tiles.Add([pscustomobject]@{ Lat=$la; West=$w })
+        }
+    }
+    return $tiles
+}
+
+function Get-SdfName {
+    # SDF naming matches utils/fetch_srtm.ps1: for HGT N<LAT>W<W> the file is
+    # <LAT>_<LAT+1>_<W-1>_<W>-hd.sdf (min_north_max_north_min_west_max_west,
+    # where min_west is the *east* edge of the tile in west-positive terms).
+    param([int]$Lat, [int]$West)
+    '{0}_{1}_{2}_{3}-hd.sdf' -f $Lat, ($Lat+1), ($West-1), $West
+}
+
+function Ensure-SrtmTiles {
+    # Make sure every tile in the requested set has an *-hd.sdf in $SdfDir.
+    # Missing ones get fetched + converted via utils/fetch_srtm.ps1, which
+    # is itself idempotent (skips tiles whose .sdf already exists). Returns
+    # the number of tiles that were actually freshly fetched.
+    param([System.Collections.Generic.List[object]]$Tiles)
+    $needed = @()
+    foreach ($t in $Tiles) {
+        $name = Get-SdfName -Lat $t.Lat -West $t.West
+        if (-not (Test-Path (Join-Path $SdfDir $name))) {
+            $needed += $t
+        }
+    }
+    if ($needed.Count -eq 0) { return 0 }
+
+    $minLat  = ($needed | Measure-Object -Property Lat  -Minimum).Minimum
+    $maxLat  = ($needed | Measure-Object -Property Lat  -Maximum).Maximum
+    $minWest = ($needed | Measure-Object -Property West -Minimum).Minimum
+    $maxWest = ($needed | Measure-Object -Property West -Maximum).Maximum
+    $fetcher = Join-Path (Split-Path $PSScriptRoot -Parent) 'utils\fetch_srtm.ps1'
+
+    & $fetcher -MinLat $minLat -MaxLat $maxLat -MinWest $minWest -MaxWest $maxWest `
+               -OutDir $SdfDir -SrtmTool $SrtmTool | Out-Null
+
+    # Count how many of the originally-missing tiles are now present.
+    $fetched = 0
+    foreach ($t in $needed) {
+        if (Test-Path (Join-Path $SdfDir (Get-SdfName -Lat $t.Lat -West $t.West))) { $fetched++ }
+    }
+    return $fetched
+}
+
 function Invoke-SplatCompute {
     param([pscustomobject]$Req)
     $name = 'live'
+
+    # 1. Auto-fetch any SRTM tiles the requested TX+range will need.
+    $fetchSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $DegLimit
+    $fetched  = 0
+    try {
+        $fetched = Ensure-SrtmTiles -Tiles $required
+    } catch {
+        return @{ ok=$false; error="SRTM fetch failed: $($_.Exception.Message)" }
+    }
+    $fetchSw.Stop()
+
     Write-Qth -Path (Join-Path $serveDir "$name.qth") `
               -Name 'LIVE' -Lat $Req.lat -LonStd $Req.lon `
               -HeightM $Req.antenna_height_m
@@ -153,7 +260,7 @@ function Invoke-SplatCompute {
         if (Test-Path $p) { Remove-Item $p -Force }
     }
 
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $splatSw = [System.Diagnostics.Stopwatch]::StartNew()
     $stdout = Join-Path $serveDir 'splat.stdout.txt'
     $stderr = Join-Path $serveDir 'splat.stderr.txt'
     $argList = @('-d', $SdfDir, '-t', "$name.qth", '-c', "$($Req.range_mi)",
@@ -161,8 +268,7 @@ function Invoke-SplatCompute {
     $proc = Start-Process -FilePath $SplatHdExe -ArgumentList $argList `
               -WorkingDirectory $serveDir -NoNewWindow -Wait -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $sw.Stop()
-    $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    $splatSw.Stop()
 
     if ($proc.ExitCode -ne 0 -or -not (Test-Path (Join-Path $serveDir 'live.png'))) {
         $errText = ''
@@ -172,7 +278,16 @@ function Invoke-SplatCompute {
         }
         return @{ ok=$false; error=("splat-hd exit " + $proc.ExitCode + ": " + $errText.Trim()) }
     }
-    return @{ ok=$true; elapsed_sec=$elapsed; png='live.png'; geo='live.geo' }
+
+    return @{
+        ok            = $true
+        png           = 'live.png'
+        geo           = 'live.geo'
+        elapsed_sec   = [math]::Round($splatSw.Elapsed.TotalSeconds, 2)
+        fetch_sec     = [math]::Round($fetchSw.Elapsed.TotalSeconds, 2)
+        tiles_needed  = $required.Count
+        tiles_fetched = $fetched
+    }
 }
 
 # --------------------- HTTP loop -------------------------------------------

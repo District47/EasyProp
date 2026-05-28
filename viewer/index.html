@@ -254,7 +254,7 @@
     };
     compBtn.disabled = true;
     const t0 = performance.now();
-    setStatus('Computing coverage… (5–20 s)', 'busy');
+    setStatus('Computing coverage… (fetches SRTM tiles on demand; up to ~90s)', 'busy');
     try {
       const r = await fetch('/compute', {
         method: 'POST',
@@ -267,7 +267,10 @@
       const bounds = await loadOverlay(`live.png?t=${t}`, `live.geo?t=${t}`);
       map.fitBounds(bounds);
       const dt = ((performance.now() - t0) / 1000).toFixed(1);
-      setStatus(`Done in ${dt}s · splat ${data.elapsed_sec.toFixed(1)}s`, 'ok');
+      const fetchNote = data.tiles_fetched > 0
+        ? ` · fetched ${data.tiles_fetched} SRTM tile${data.tiles_fetched > 1 ? 's' : ''} (${data.fetch_sec.toFixed(1)}s)`
+        : (data.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
+      setStatus(`Done ${dt}s · splat ${data.elapsed_sec.toFixed(1)}s${fetchNote}`, 'ok');
     } catch (e) {
       setStatus('FAIL: ' + e.message, 'err');
     } finally {
