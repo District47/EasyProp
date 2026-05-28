@@ -40,7 +40,11 @@
 #>
 param(
     [Parameter(Position=0)][string]$BaseName = "live",
-    [string]$SourceDir  = ".",
+    # Default to a per-user writable dir (NOT the current directory). The
+    # cwd is unreliable -- if the user launches from a Start Menu PowerShell
+    # shortcut, cwd is C:\Windows\system32, and any auto-fetch would silently
+    # fail with permission-denied writing tile downloads.
+    [string]$SourceDir  = "$env:LOCALAPPDATA\EasyProp\work-hd",
     [string]$SdfDir     = "",
     [string]$SplatHdExe = "C:\splat-build-hd\Release\splat-hd.exe",
     [string]$SrtmTool   = "C:\splat-build\utils\Release\srtm2sdf-hd.exe",
@@ -57,9 +61,30 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Make sure $SourceDir exists; create it if it's the per-user default and
+# the user has just run the script for the first time. Then Resolve-Path
+# happily turns it into an absolute path.
+if (-not (Test-Path $SourceDir)) {
+    New-Item -ItemType Directory -Force -Path $SourceDir | Out-Null
+}
 $srcAbs = (Resolve-Path $SourceDir).Path
 if ([string]::IsNullOrEmpty($SdfDir)) { $SdfDir = $srcAbs }
-else { $SdfDir = (Resolve-Path $SdfDir).Path }
+else {
+    if (-not (Test-Path $SdfDir)) { New-Item -ItemType Directory -Force -Path $SdfDir | Out-Null }
+    $SdfDir = (Resolve-Path $SdfDir).Path
+}
+
+# Sanity check: refuse to write into Windows / Program Files, even if the
+# user explicitly pointed us there. Better to fail loudly here than to mask
+# the error as a fake "404 from all mirrors" inside the fetcher.
+foreach ($d in @($srcAbs, $SdfDir)) {
+    if ($d -like 'C:\Windows*' -or $d -like 'C:\Program Files*' -or
+        $d -like "${env:ProgramFiles(x86)}*") {
+        Write-Host "FAIL: $d is a system directory; pick a writable folder for -SourceDir / -SdfDir." -ForegroundColor Red
+        Write-Host "      Defaults to $env:LOCALAPPDATA\EasyProp\work-hd if you omit -SourceDir." -ForegroundColor Yellow
+        exit 2
+    }
+}
 
 if (-not (Test-Path $SplatHdExe)) {
     Write-Host "FAIL: splat-hd.exe not found at $SplatHdExe" -ForegroundColor Red

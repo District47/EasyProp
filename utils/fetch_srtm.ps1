@@ -114,11 +114,15 @@ for ($lat = $MinLat; $lat -le $MaxLat; $lat++) {
         # Try each mirror in turn; first success wins.
         $hgt = $null
         $mirrorTag = ''
+        $lastError = ''
+        $lastStatus = 0
         foreach ($m in Get-MirrorUrls -Tile $tile -LatPrefix $latPfx) {
             $tmp = Join-Path $OutDir "$tile.$(if ($m.kind -eq 'gz') {'hgt.gz'} else {'SRTMGL1.hgt.zip'})"
             try {
                 Invoke-WebRequest -Uri $m.url -OutFile $tmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
             } catch {
+                $lastError  = $_.Exception.Message
+                $lastStatus = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
                 continue
             }
             $hgt = Expand-Hgt -Src $tmp -Kind $m.kind -Tile $tile -OutDir $OutDir
@@ -128,8 +132,16 @@ for ($lat = $MinLat; $lat -le $MaxLat; $lat++) {
 
         Write-Host ("  {0,-8} fetch  " -f $tile) -NoNewline
         if (-not $hgt) {
-            Write-Host "404 from all mirrors (likely ocean), skipping" -ForegroundColor DarkYellow
-            $skipped++
+            # Only call it "ocean" if every mirror really 404'd. Anything else
+            # (timeout / permission denied / DNS / etc.) is a real failure that
+            # should surface, not be misreported as a missing tile.
+            if ($lastStatus -eq 404) {
+                Write-Host "404 from all mirrors (likely ocean), skipping" -ForegroundColor DarkYellow
+                $skipped++
+            } else {
+                Write-Host ("FAIL: {0}" -f $lastError) -ForegroundColor Red
+                $failed++
+            }
             continue
         }
 
