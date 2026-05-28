@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SPLAT! Coverage Viewer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin="">
+<style>
+  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+  #map { height: 100%; }
+  .splat-panel {
+    background: rgba(255,255,255,0.95);
+    padding: 10px 14px;
+    border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    font-size: 13px;
+    min-width: 220px;
+  }
+  .splat-panel h3 { margin: 0 0 6px 0; font-size: 14px; }
+  .splat-panel .meta { color: #666; font-size: 11px; margin-bottom: 8px; }
+  .splat-panel label { display: block; margin-top: 6px; }
+  .splat-panel input[type=range] { width: 100%; }
+  .splat-panel .bounds { font-family: ui-monospace, Consolas, monospace;
+                         font-size: 11px; color: #555; margin-top: 6px;
+                         line-height: 1.4; }
+  .splat-panel .err { color: #c00; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""></script>
+<script>
+(async () => {
+  // ?name=foo  -> loads ./foo.png + ./foo.geo (defaults to "coverage")
+  const params = new URLSearchParams(location.search);
+  const name = params.get('name') || 'coverage';
+
+  // Base map.
+  const map = L.map('map').setView([40.5, -74.5], 9);  // tentative; fitted later
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap'
+  }).addTo(map);
+
+  // Side panel.
+  const panel = L.control({ position: 'topright' });
+  panel.onAdd = () => {
+    const div = L.DomUtil.create('div', 'splat-panel');
+    div.innerHTML = `
+      <h3>SPLAT! Coverage</h3>
+      <div class="meta">${name}.png · georeferenced overlay</div>
+      <label>Overlay opacity
+        <input id="op" type="range" min="0" max="1" step="0.05" value="0.6">
+      </label>
+      <button id="fit" style="margin-top:8px;width:100%;padding:6px;">
+        Fit to coverage
+      </button>
+      <div id="bounds" class="bounds"></div>
+    `;
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  };
+  panel.addTo(map);
+
+  // Read the .geo sidecar (Xastir format). 2 TIEPOINT lines give us
+  // (image-pixel-x, image-pixel-y, lon, lat) for opposite corners.
+  let txt;
+  try {
+    const r = await fetch(`${name}.geo`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    txt = await r.text();
+  } catch (e) {
+    document.getElementById('bounds').innerHTML =
+      `<span class="err">Could not load ${name}.geo: ${e.message}</span>`;
+    return;
+  }
+
+  const tiepoints = txt.split('\n')
+    .filter(l => l.startsWith('TIEPOINT'))
+    .map(l => {
+      const f = l.split(/\s+/);
+      return { x:+f[1], y:+f[2], lon:+f[3], lat:+f[4] };
+    });
+  if (tiepoints.length < 2) {
+    document.getElementById('bounds').textContent =
+      'Bad .geo file (no TIEPOINT lines)';
+    return;
+  }
+
+  const lats = tiepoints.map(p => p.lat);
+  const lons = tiepoints.map(p => p.lon);
+  const south = Math.min(...lats), north = Math.max(...lats);
+  const west  = Math.min(...lons), east  = Math.max(...lons);
+  const bounds = [[south, west], [north, east]];
+
+  document.getElementById('bounds').innerHTML =
+    `north ${north.toFixed(4)}<br>south ${south.toFixed(4)}<br>` +
+    `west  ${west.toFixed(4)}<br>east  ${east.toFixed(4)}`;
+
+  const overlay = L.imageOverlay(`${name}.png`, bounds, {
+    opacity: 0.6,
+    interactive: false
+  }).addTo(map);
+  map.fitBounds(bounds);
+
+  document.getElementById('op').addEventListener('input', e => {
+    overlay.setOpacity(parseFloat(e.target.value));
+  });
+  document.getElementById('fit').addEventListener('click', () => {
+    map.fitBounds(bounds);
+  });
+})();
+</script>
+</body>
+</html>
