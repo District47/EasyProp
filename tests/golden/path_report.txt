@@ -1,0 +1,63 @@
+
+		--==[ SPLAT! v1.4.2 Path Analysis ]==--
+
+---------------------------------------------------------------------------
+
+Transmitter site: WNJU-DT
+Site location: 40.8022 North / 74.2464 West (40° 48' 7" N / 74° 14' 46" W)
+Ground elevation: 50.00 meters AMSL
+Antenna height: 98.50 meters AGL / 148.50 meters AMSL
+Antenna height above average terrain: 98.50 meters
+Distance to RX-NEAR: 1.61 kilometers
+Azimuth to RX-NEAR: 0.00 degrees
+Depression angle to RX-NEAR: -2.4514 degrees
+
+---------------------------------------------------------------------------
+
+Receiver site: RX-NEAR
+Site location: 40.8167 North / 74.2464 West (40° 49' 0" N / 74° 14' 46" W)
+Ground elevation: 50.00 meters AMSL
+Antenna height: 30.00 meters AGL / 80.00 meters AMSL
+Antenna height above average terrain: 30.00 meters
+Distance to WNJU-DT: 1.61 kilometers
+Azimuth to WNJU-DT: 180.00 degrees
+Elevation angle to WNJU-DT: +2.4370 degrees
+
+---------------------------------------------------------------------------
+
+ITWOM Version 3.0 Parameters Used In This Analysis:
+
+Earth's Dielectric Constant: 15.000
+Earth's Conductivity: 0.005 Siemens/meter
+Atmospheric Bending Constant (N-units): 301.000 ppm
+Frequency: 605.000 MHz
+Radio Climate: 5 (Continental Temperate)
+Polarization: 0 (Horizontal)
+Fraction of Situations: 50.0%
+Fraction of Time: 90.0%
+Transmitter ERP: 650.000 kilowatts (+88.13 dBm)
+Transmitter EIRP: 1063.931 kilowatts (+90.27 dBm)
+
+---------------------------------------------------------------------------
+
+Summary For The Link Between WNJU-DT and RX-NEAR:
+
+Free space path loss: 92.22 dB
+ITWOM Version 3.0 path loss: 107.46 dB
+Attenuation due to terrain shielding: 15.24 dB
+Field strength at RX-NEAR: 115.70 dBuV/meter
+Signal power level at RX-NEAR: -17.19 dBm
+Signal power density at RX-NEAR: -30.08 dBW per square meter
+Voltage across a 50 ohm dipole at RX-NEAR: 39527.56 uV (91.94 dBuV)
+Voltage across a 75 ohm dipole at RX-NEAR: 48411.17 uV (93.70 dBuV)
+Mode of propagation: Line of Sight
+ITWOM error number: 0 (No error)
+
+---------------------------------------------------------------------------
+
+
+No obstructions to LOS path due to terrain were detected by SPLAT!
+
+The first Fresnel zone is clear.
+
+60% of the first Fresnel zone is clear.
