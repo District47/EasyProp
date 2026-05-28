@@ -14,8 +14,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <bzlib.h>
+#include "compat/platform.h"   /* unistd shim + SDF_SEP for Windows */
+
+/* SRTM .hgt files are raw big-endian int16 -- on Windows the C runtime opens
+   files in text mode by default, which silently mangles 0x0A bytes. Make sure
+   we open the input as a binary stream regardless of platform. */
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 #define BZBUFFER 65536
 
@@ -157,7 +164,7 @@ int ReadSRTM(char *filename)
 		}
 	}
 
-	infile=open(filename, O_RDONLY);
+	infile=open(filename, O_RDONLY | O_BINARY);
 
 	if (infile==0)
 	{
@@ -177,9 +184,9 @@ int ReadSRTM(char *filename)
 	lseek(infile,0L,SEEK_SET);
 
 	if (ippd==3600)
-		sprintf(sdf_filename, "%d:%d:%d:%d-hd.sdf", min_north, max_north, min_west, max_west);
+		sprintf(sdf_filename, "%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d-hd.sdf", min_north, max_north, min_west, max_west);
 	else
-		sprintf(sdf_filename, "%d:%d:%d:%d.sdf", min_north, max_north, min_west, max_west);
+		sprintf(sdf_filename, "%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d.sdf", min_north, max_north, min_west, max_west);
 
 	error=0;
 	replacement_flag=0;
@@ -428,7 +435,7 @@ int ReadUSGS()
 	   Full path and extentions are added later though
 	   subsequent function calls. */
 
-	sprintf(usgs_filename, "%d:%d:%d:%d", min_north, max_north, min_west, max_west);
+	sprintf(usgs_filename, "%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d", min_north, max_north, min_west, max_west);
 
 	return (LoadSDF(usgs_filename));
 }
@@ -675,11 +682,23 @@ int main(int argc, char **argv)
 
 	if (sdf_path[0]==0)
 	{
+		/* POSIX-only convention: $HOME/.splat_path holds a default SDF dir.
+		   On Windows HOME is typically unset; treat that as "no default path"
+		   rather than dereferencing NULL into sprintf. */
 		env=getenv("HOME");
 
-		sprintf(string,"%s/.splat_path",env);
+		if (env==NULL)
+			env=getenv("USERPROFILE");  /* Windows fallback */
 
-		fd=fopen(string,"r");
+		if (env!=NULL)
+		{
+			sprintf(string,"%s/.splat_path",env);
+			fd=fopen(string,"r");
+		}
+		else
+		{
+			fd=NULL;
+		}
 
 		if (fd!=NULL)
 		{

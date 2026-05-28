@@ -1,32 +1,43 @@
 # ---------------------------------------------------------------------------
 # SPLAT! companion utilities.
 #
-# These are the original C programs from the legacy `utils/build` script.
-# They are OFF by default (SPLAT_BUILD_UTILS) because they are older C and
-# may still need Windows portability work; the core `splat` target is the
-# Phase-1 deliverable.  srtm2sdf is linked against BZip2; fontdata needs zlib.
+# Of the original five (srtm2sdf, usgs2sdf, citydecoder, bearing, fontdata),
+# only `srtm2sdf` has been ported to Windows so far -- it's the one that's
+# load-bearing for the new workflow (fetch SRTM hgt -> srtm2sdf -> splat).
+# The other four still rely on POSIX-only constructs and only build for
+# non-MSVC targets; turn SPLAT_BUILD_UTILS=ON to attempt them on Linux/Mac.
 # ---------------------------------------------------------------------------
 
 enable_language(C)
 
-add_executable(citydecoder citydecoder.c)
-add_executable(usgs2sdf    usgs2sdf.c)
-add_executable(bearing     bearing.c)
-
-add_executable(srtm2sdf    srtm2sdf.c)
+# --- srtm2sdf (ported; builds on MSVC + POSIX) ------------------------------
+add_executable(srtm2sdf srtm2sdf.c)
 target_link_libraries(srtm2sdf PRIVATE BZip2::BZip2)
+target_include_directories(srtm2sdf PRIVATE "${CMAKE_SOURCE_DIR}/src")
 
-# The original ships srtm2sdf-hd as a symlink to srtm2sdf; the program selects
-# HD mode from its own argv[0] name. Build a second, identically-sourced binary.
+# The HD variant is the same source compiled to a different binary name --
+# the program checks its own argv[0] to decide IPPD=1200 vs 3600. Upstream
+# achieves this with a symlink (which Windows can't reliably do); we ship
+# two binaries instead.
 add_executable(srtm2sdf-hd srtm2sdf.c)
 target_link_libraries(srtm2sdf-hd PRIVATE BZip2::BZip2)
+target_include_directories(srtm2sdf-hd PRIVATE "${CMAKE_SOURCE_DIR}/src")
 set_target_properties(srtm2sdf-hd PROPERTIES OUTPUT_NAME "srtm2sdf-hd")
 
-if(ZLIB_FOUND)
-  add_executable(fontdata fontdata.c)
-  target_link_libraries(fontdata PRIVATE ZLIB::ZLIB)
+if(MSVC)
+  foreach(_t srtm2sdf srtm2sdf-hd)
+    target_compile_definitions(${_t} PRIVATE
+      _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+  endforeach()
 endif()
 
-if(MSVC)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+# --- Not-yet-ported (POSIX-only) -------------------------------------------
+if(NOT MSVC)
+  add_executable(citydecoder citydecoder.c)
+  add_executable(usgs2sdf    usgs2sdf.c)
+  add_executable(bearing     bearing.c)
+  if(ZLIB_FOUND)
+    add_executable(fontdata fontdata.c)
+    target_link_libraries(fontdata PRIVATE ZLIB::ZLIB)
+  endif()
 endif()

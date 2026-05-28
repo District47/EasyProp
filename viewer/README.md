@@ -4,6 +4,13 @@ A tiny browser viewer that overlays SPLAT!'s coverage maps on an
 OpenStreetMap basemap, geographically anchored using the `.geo` sidecar
 SPLAT! already emits.
 
+![WNJU-DT coverage over real SRTM terrain](screenshots/wnju-real-terrain.png)
+
+*30-mile line-of-sight coverage from WNJU-DT (40.8°N, 74.25°W) over real
+1-arc-second SRTM elevation data. The coverage shape is irregular because
+the Watchung ridges to the west shadow the signal; the river valleys carry
+it further than the surrounding hills do.*
+
 ## What you get
 
 - **OSM basemap** under your coverage data, so you can see exactly where
@@ -28,6 +35,40 @@ splat -t wnju-dt.qth -c 30 -metric -geo -o coverage.png
 
 That's it. Ctrl+C in the launch.ps1 window stops the server and cleans
 up its temp dir.
+
+## End-to-end with real SRTM terrain
+
+The hero shot above was produced by this pipeline:
+
+```powershell
+# 0. One-time: build srtm2sdf-hd (the HD SRTM converter).
+cmake -S . -B C:\splat-build -G "Visual Studio 17 2022" -A x64 -DSPLAT_BUILD_UTILS=ON
+cmake --build C:\splat-build --config Release --target srtm2sdf-hd
+
+# 0. One-time: build an HD splat (-DSPLAT_HD_MODE=1, in a separate build dir
+#    so the std-res splat + its baselines stay intact).
+cmake -S . -B C:\splat-build-hd -G "Visual Studio 17 2022" -A x64 `
+      -DSPLAT_HD_MODE=1 -DSPLAT_MAXPAGES=4
+
+# 1. Fetch + convert the 4 SRTM tiles around WNJU-DT (40-41N x 73-74W
+#    SW-corner range -> covers 40-42N x 73-75W in 4 tiles, ~30 MB total).
+mkdir C:\splat-work; cd C:\splat-work
+copy ..\sample_data\wnju-dt.qth .
+copy ..\sample_data\wnju-dt.lrp .
+..\utils\fetch_srtm.ps1 -MinLat 40 -MaxLat 41 -MinWest 74 -MaxWest 75
+
+# 2. Run an HD coverage analysis (1-arc-second resolution -> 7200x7200 image).
+C:\splat-build-hd\Release\splat-hd.exe `
+    -t wnju-dt.qth -c 30 -metric -geo -o wnju-real.png
+
+# 3. View it.
+..\viewer\launch.ps1 wnju-real
+```
+
+`fetch_srtm.ps1` pulls from ESA's public SRTMGL1 mirror (no auth, ~1.8 MB
+per 1-arc-second tile), unzips, and runs `srtm2sdf-hd` on each `.hgt` to
+produce the `<lat>_<lat+1>_<west>_<west+1>-hd.sdf` files SPLAT! HD reads.
+Ocean tiles 404 from ESA and are skipped automatically.
 
 ## How it works (no magic)
 

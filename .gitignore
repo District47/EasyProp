@@ -22,6 +22,7 @@ src/splat_config.h
 # Note: these are generated in the working dir at runtime. We intentionally
 # do NOT ignore anything under sample_data/ (those are upstream inputs,
 # including wnju-dt.scf signal-color and the .az/.el antenna-pattern files).
+# Documentation screenshots under viewer/screenshots/ are also tracked.
 *.ppm
 *.png
 *.kml
@@ -30,6 +31,7 @@ src/splat_config.h
 *.dot
 sample_data/sdf/
 !sample_data/**
+!viewer/screenshots/**
 
 # --- Dependencies / package managers ---
 vcpkg_installed/
