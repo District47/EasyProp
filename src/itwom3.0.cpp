@@ -2043,7 +2043,8 @@ double d1thx(double pfl[], const double &x1, const double &x2)
 	n=10*ka-5;
 	kb=n-ka+1;
 	sn=n-1;
-	assert((s=new double[n+2])!=0);
+	s=new double[n+2];
+	assert(s!=0);
 	s[0]=sn;
 	s[1]=1.0;
 	xb=(xb-xa)/sn;
@@ -2099,7 +2100,8 @@ double d1thx2(double pfl[], const double &x1, const double &x2, propa_type &prop
 	n=10*ka-5;
 	kb=n-ka+1;
 	sn=n-1;
-	assert((s=new double[n+2])!=0);
+	s=new double[n+2];
+	assert(s!=0);
 	s[0]=sn;
 	s[1]=1.0;
 	xb=(xb-xa)/sn;

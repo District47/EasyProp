@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "splat",
+  "version-string": "1.4.2",
+  "description": "SPLAT! -- RF signal propagation, loss, and terrain analysis tool (cross-platform port).",
+  "homepage": "https://www.qsl.net/kd2bd/splat.html",
+  "dependencies": [
+    "bzip2",
+    "zlib"
+  ]
+}

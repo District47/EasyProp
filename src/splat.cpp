@@ -26,9 +26,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <bzlib.h>
-#include <unistd.h>
+#include "compat/platform.h"
 #include "fontdata.h"
-#include "splat.h"
+#include "splat_config.h"
 
 #define GAMMA 2.5
 #define BZBUFFER 65536
@@ -151,10 +151,38 @@ struct dem {	int min_north;
 		int max_west;
 		int max_el;
 		int min_el;
-		short data[IPPD][IPPD];
-		unsigned char mask[IPPD][IPPD];
-		unsigned char signal[IPPD][IPPD];
+		/* These three buffers dominate SPLAT!'s memory footprint
+		   (up to ~3.3 GB in HD 8x8 mode).  Originally fixed
+		   [IPPD][IPPD] arrays held inline, they are now pointers to
+		   heap-allocated, row-major blocks of IPPD*IPPD elements (see
+		   AllocateDEM()).  Declaring them as pointer-to-row keeps the
+		   identical "data[x][y]" indexing and identical memory layout
+		   (stride IPPD) at every call site, while moving the bulk
+		   storage off the static/BSS segment.  This is what allows the
+		   program to link under MSVC, which has no equivalent of gcc's
+		   -mcmodel=medium for multi-gigabyte static data. */
+		short (*data)[IPPD];
+		unsigned char (*mask)[IPPD];
+		unsigned char (*signal)[IPPD];
            }	dem[MAXPAGES];
+
+/* Allocate the per-page DEM buffers on the heap.  calloc() zero-initializes,
+   matching the previous zero-initialized static arrays.  Called once at
+   startup for every page.  Returns 0 on success, -1 on allocation failure. */
+static int AllocateDEM(void)
+{
+	for (int p=0; p<MAXPAGES; p++)
+	{
+		dem[p].data=(short (*)[IPPD])calloc((size_t)IPPD*IPPD,sizeof(short));
+		dem[p].mask=(unsigned char (*)[IPPD])calloc((size_t)IPPD*IPPD,sizeof(unsigned char));
+		dem[p].signal=(unsigned char (*)[IPPD])calloc((size_t)IPPD*IPPD,sizeof(unsigned char));
+
+		if (dem[p].data==NULL || dem[p].mask==NULL || dem[p].signal==NULL)
+			return -1;
+	}
+
+	return 0;
+}
 
 struct LR {	double eps_dielect; 
 		double sgm_conductivity; 
@@ -2246,19 +2274,16 @@ void LoadUDT(char *filename)
 	   are added to the ground elevations described by the digital
 	   elevation data already loaded into memory. */
 
-	int	i, x, y, z, ypix, xpix, tempxpix, tempypix, fd=0;
-	char	input[80], str[3][80], tempname[15], *pointer=NULL;
+	int	i, x, y, z, ypix, xpix, tempxpix, tempypix;
+	char	input[80], str[3][80], tempname[260], *pointer=NULL;
 	double	latitude, longitude, height, tempheight;
 	FILE	*fd1=NULL, *fd2=NULL;
-
-	strcpy(tempname,"/tmp/XXXXXX\0");
 
 	fd1=fopen(filename,"r");
 
 	if (fd1!=NULL)
 	{
-		fd=mkstemp(tempname);
-		fd2=fopen(tempname,"w");
+		fd2=splat_tmpfile(tempname,sizeof(tempname));
 
 		fgets(input,78,fd1);
 
@@ -2336,7 +2361,6 @@ void LoadUDT(char *filename)
 
 		fclose(fd1);
 		fclose(fd2);
-		close(fd);
 
 		fprintf(stdout,"Done!");
 		fflush(stdout);
@@ -7912,6 +7936,13 @@ int main(int argc, char *argv[])
 	{
 		tx_site[x].lat=91.0;
 		tx_site[x].lon=361.0;
+	}
+
+	if (AllocateDEM()!=0)
+	{
+		fprintf(stderr,"\n*** ERROR: Unable to allocate terrain memory for %d page(s) at %d pixels/degree.\n", MAXPAGES, IPPD);
+		fprintf(stderr,"    Reduce SPLAT_MAXPAGES (or use standard instead of HD mode) and rebuild.\n\n");
+		return -1;
 	}
 
 	for (x=0; x<MAXPAGES; x++)
