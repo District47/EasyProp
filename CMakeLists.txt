@@ -53,7 +53,8 @@ include(cmake/Dependencies.cmake)
 add_executable(splat
   src/splat.cpp
   src/itwom3.0.cpp
-  src/compat/platform.cpp)
+  src/compat/platform.cpp
+  src/render/PngWriter.cpp)
 
 target_include_directories(splat PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"   # generated splat_config.h

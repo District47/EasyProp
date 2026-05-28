@@ -28,6 +28,7 @@
 #include <bzlib.h>
 #include "compat/platform.h"
 #include "fontdata.h"
+#include "render/Image.h"
 #include "splat_config.h"
 
 #define GAMMA 2.5
@@ -3902,19 +3903,69 @@ void LoadDBMColors(struct site xmtr)
 	}
 }
 
+/* Per-pixel color for the topographic map -- the kernel that was previously
+   inlined as a big switch inside the WritePPM fprintf loop. Extracted so the
+   PPM (streamed) and PNG (buffered) paths share identical pixel decisions,
+   guaranteeing the PPM output stays byte-for-byte unchanged. */
+static inline render::Color topo_pixel_color(int indx, int x0, int y0,
+                                             unsigned char ngs,
+                                             int min_elev,
+                                             double one_over_gamma,
+                                             double conversion)
+{
+	unsigned char mask = dem[indx].mask[x0][y0];
+
+	if (mask & 2)  return render::Color{255,   0,   0};  /* Text Labels:      Red          */
+	if (mask & 4)  return render::Color{128, 128, 255};  /* County Boundaries: Light Cyan  */
+
+	switch (mask & 57)
+	{
+		case  1: return render::Color{  0, 255,   0};  /* TX1: Green                    */
+		case  8: return render::Color{  0, 255, 255};  /* TX2: Cyan                     */
+		case  9: return render::Color{255, 255,   0};  /* TX1 + TX2: Yellow             */
+		case 16: return render::Color{147, 112, 219};  /* TX3: Medium Violet            */
+		case 17: return render::Color{255, 192, 203};  /* TX1 + TX3: Pink               */
+		case 24: return render::Color{255, 165,   0};  /* TX2 + TX3: Orange             */
+		case 25: return render::Color{  0, 100,   0};  /* TX1 + TX2 + TX3: Dark Green   */
+		case 32: return render::Color{255, 130,  71};  /* TX4: Sienna 1                 */
+		case 33: return render::Color{173, 255,  47};  /* TX1 + TX4: Green Yellow       */
+		case 40: return render::Color{193, 255, 193};  /* TX2 + TX4: Dark Sea Green 1   */
+		case 41: return render::Color{255, 235, 205};  /* TX1+TX2+TX4: Blanched Almond  */
+		case 48: return render::Color{  0, 206, 209};  /* TX3 + TX4: Dark Turquoise     */
+		case 49: return render::Color{  0, 250, 154};  /* TX1+TX3+TX4: Medium Spring G. */
+		case 56: return render::Color{210, 180, 140};  /* TX2 + TX3 + TX4: Tan          */
+		case 57: return render::Color{238, 201,   0};  /* All four TXs: Gold2           */
+		default:
+			if (ngs)
+				return render::Color{255, 255, 255};  /* No terrain (ngs flag) */
+			{
+				short data = dem[indx].data[x0][y0];
+				if (data == 0)
+					return render::Color{0, 0, 170};  /* Sea-level: Medium Blue */
+				unsigned terrain = (unsigned)(0.5 + pow((double)(data - min_elev),
+				                                        one_over_gamma) * conversion);
+				/* Match the original fprintf("%c", terrain) low-byte truncation
+				   so PPM bytes are bit-identical to the pre-refactor version. */
+				unsigned char t = (unsigned char)terrain;
+				return render::Color{t, t, t};
+			}
+	}
+}
+
 void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned char ngs, struct site *xmtr, unsigned char txsites)
 {
-	/* This function generates a topographic map in Portable Pix Map
-	   (PPM) format based on logarithmically scaled topology data,
-	   as well as the content of flags held in the mask[][] array.
-	   The image created is rotated counter-clockwise 90 degrees
-	   from its representation in dem[][] so that north points
-	   up and east points right in the image generated. */
+	/* This function generates a topographic map in either Portable Pix Map
+	   (PPM, the upstream default) or PNG format -- chosen by the extension
+	   on `filename`. Pixel colors come from the topology data plus mask[][]
+	   flags. The image is rotated counter-clockwise 90 degrees from its
+	   representation in dem[][] so that north points up and east points
+	   right in the image generated. */
 
 	char mapfile[255], geofile[255], kmlfile[255];
-	unsigned char found, mask;
-	unsigned width, height, terrain;
+	unsigned char found;
+	unsigned width, height;
 	int indx, x, y, x0=0, y0=0;
+	int png_output=0;  /* selected by .png extension on `filename` */
 	double lat, lon, conversion, one_over_gamma,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -3937,6 +3988,11 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	{
 		if (filename[y-1]=='m' && filename[y-2]=='p' && filename[y-3]=='p' && filename[y-4]=='.')
 			y-=4;
+		else if (filename[y-1]=='g' && filename[y-2]=='n' && filename[y-3]=='p' && filename[y-4]=='.')
+		{
+			y-=4;
+			png_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -3949,13 +4005,18 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	mapfile[x+1]='p';
+	if (png_output)
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
+	}
+	else
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='p'; mapfile[x+3]='m';
+	}
 	geofile[x+1]='g';
 	kmlfile[x+1]='k';
-	mapfile[x+2]='p';
 	geofile[x+2]='e';
 	kmlfile[x+2]='m';
-	mapfile[x+3]='m';
 	geofile[x+3]='o';
 	kmlfile[x+3]='l';
 	mapfile[x+4]=0;
@@ -4041,10 +4102,23 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 		fclose(fd);
 	}
 
-	fd=fopen(mapfile,"wb");
+	/* PPM stays streamed (matches upstream byte-for-byte); PNG buffers the
+	   full frame and is written in one shot at the end via stb_image_write. */
+	render::Image *img = NULL;
+	fd = NULL;
 
-	fprintf(fd,"P6\n%u %u\n255\n",width,height);
-	fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height);
+	if (png_output)
+	{
+		img = new render::Image(width, height);
+	}
+	else
+	{
+		fd = fopen(mapfile,"wb");
+		fprintf(fd,"P6\n%u %u\n255\n",width,height);
+	}
+
+	fprintf(stdout,"\nWriting \"%s\" (%ux%u %s image)... ",
+	        mapfile, width, height, png_output ? "png" : "pixmap");
 	fflush(stdout);
 
 	for (y=0, lat=north; y<(int)height; y++, lat=north-(dpp*(double)y))
@@ -4065,124 +4139,31 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 					indx++;
 			}
 
+			render::Color c;
 			if (found)
-			{
-				mask=dem[indx].mask[x0][y0];
-
-				if (mask&2)
-					/* Text Labels: Red */
-					fprintf(fd,"%c%c%c",255,0,0);
-
-				else if (mask&4)
-					/* County Boundaries: Light Cyan */
-					fprintf(fd,"%c%c%c",128,128,255);
-
-				else switch (mask&57)
-				{
-					case 1:
-					/* TX1: Green */
-					fprintf(fd,"%c%c%c",0,255,0);
-					break;
-
-					case 8:
-					/* TX2: Cyan */
-					fprintf(fd,"%c%c%c",0,255,255);
-					break;
-
-					case 9:
-					/* TX1 + TX2: Yellow */
-					fprintf(fd,"%c%c%c",255,255,0);
-					break;
-
-					case 16:
-					/* TX3: Medium Violet */
-					fprintf(fd,"%c%c%c",147,112,219);
-					break;
-
-					case 17:
-					/* TX1 + TX3: Pink */
-					fprintf(fd,"%c%c%c",255,192,203);
-					break;
-
-					case 24:
-					/* TX2 + TX3: Orange */
-					fprintf(fd,"%c%c%c",255,165,0);
-					break;
-
-				 	case 25:
-					/* TX1 + TX2 + TX3: Dark Green */
-					fprintf(fd,"%c%c%c",0,100,0);
-					break;
-
-					case 32:
-					/* TX4: Sienna 1 */
-					fprintf(fd,"%c%c%c",255,130,71);
-					break;
-
-					case 33:
-					/* TX1 + TX4: Green Yellow */
-					fprintf(fd,"%c%c%c",173,255,47);
-					break;
-
-					case 40:
-					/* TX2 + TX4: Dark Sea Green 1 */
-					fprintf(fd,"%c%c%c",193,255,193);
-					break;
-
-					case 41:
-					/* TX1 + TX2 + TX4: Blanched Almond */
-					fprintf(fd,"%c%c%c",255,235,205);
-					break;
-
-					case 48:
-					/* TX3 + TX4: Dark Turquoise */
-					fprintf(fd,"%c%c%c",0,206,209);
-					break;
-
-					case 49:
-					/* TX1 + TX3 + TX4: Medium Spring Green */
-					fprintf(fd,"%c%c%c",0,250,154);
-					break;
-
-					case 56:
-					/* TX2 + TX3 + TX4: Tan */
-					fprintf(fd,"%c%c%c",210,180,140);
-					break;
-
-					case 57:
-					/* TX1 + TX2 + TX3 + TX4: Gold2 */
-					fprintf(fd,"%c%c%c",238,201,0);
-					break;
-
-					default:
-					if (ngs)  /* No terrain */
-						fprintf(fd,"%c%c%c",255,255,255);
-					else
-					{
-						/* Sea-level: Medium Blue */
-						if (dem[indx].data[x0][y0]==0)
-							fprintf(fd,"%c%c%c",0,0,170);
-						else
-						{
-							/* Elevation: Greyscale */
-							terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-							fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-						}
-					}
-				}
-			}
-
+				c = topo_pixel_color(indx, x0, y0, ngs,
+				                     min_elevation, one_over_gamma, conversion);
 			else
-			{
-				/* We should never get here, but if */
-				/* we do, display the region as black */
+				/* We should never get here, but if we do display as black. */
+				c = render::Color{0, 0, 0};
 
-				fprintf(fd,"%c%c%c",0,0,0);
-			}
+			if (png_output)
+				img->set((unsigned)x, (unsigned)y, c);
+			else
+				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
 		}
 	}
 
-	fclose(fd);
+	if (png_output)
+	{
+		if (!render::write_png(*img, mapfile))
+			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
+		delete img;
+	}
+	else
+	{
+		fclose(fd);
+	}
 	fprintf(stdout,"Done!\n");
 	fflush(stdout);
 }
@@ -7853,7 +7834,7 @@ int main(int argc, char *argv[])
 		fprintf(stdout,"       -h filename of terrain height graph to plot\n");
 		fprintf(stdout,"       -H filename of normalized terrain height graph to plot\n");
 		fprintf(stdout,"       -l filename of path loss graph to plot\n");
-		fprintf(stdout,"       -o filename of topographic map to generate (.ppm)\n");
+		fprintf(stdout,"       -o filename of topographic map to generate (.ppm or .png)\n");
 		fprintf(stdout,"       -u filename of user-defined terrain file to import\n");
 		fprintf(stdout,"       -d sdf file directory path (overrides path in ~/.splat_path file)\n");
 		fprintf(stdout,"       -m earth radius multiplier\n");
