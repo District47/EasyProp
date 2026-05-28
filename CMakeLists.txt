@@ -54,13 +54,14 @@ add_executable(splat
   src/splat.cpp
   src/itwom3.0.cpp
   src/compat/platform.cpp
-  src/render/PngWriter.cpp)
+  src/render/PngWriter.cpp
+  src/render/GeoTiffWriter.cpp)
 
 target_include_directories(splat PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"   # generated splat_config.h
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-target_link_libraries(splat PRIVATE BZip2::BZip2)
+target_link_libraries(splat PRIVATE BZip2::BZip2 TIFF::TIFF)
 
 if(MSVC)
   target_compile_definitions(splat PRIVATE

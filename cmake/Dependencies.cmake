@@ -15,3 +15,8 @@ find_package(ZLIB QUIET)
 if(NOT ZLIB_FOUND)
   message(STATUS "zlib not found -- the 'fontdata' utility will be unavailable.")
 endif()
+
+# libtiff drives the GeoTIFF writer in src/render/GeoTiffWriter.cpp. We write
+# the geo-key tags ourselves (no libgeotiff dependency) -- libtiff alone is
+# enough to emit a fully conformant GeoTIFF.
+find_package(TIFF REQUIRED)

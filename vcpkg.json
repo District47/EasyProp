@@ -6,6 +6,7 @@
   "homepage": "https://www.qsl.net/kd2bd/splat.html",
   "dependencies": [
     "bzip2",
-    "zlib"
+    "zlib",
+    "tiff"
   ]
 }

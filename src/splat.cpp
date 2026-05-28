@@ -3966,6 +3966,7 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	unsigned width, height;
 	int indx, x, y, x0=0, y0=0;
 	int png_output=0;  /* selected by .png extension on `filename` */
+	int tif_output=0;  /* selected by .tif or .tiff extension on `filename` */
 	double lat, lon, conversion, one_over_gamma,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -3993,6 +3994,16 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 			y-=4;
 			png_output=1;
 		}
+		else if (filename[y-1]=='f' && filename[y-2]=='i' && filename[y-3]=='t' && filename[y-4]=='.')
+		{
+			y-=4;
+			tif_output=1;
+		}
+		else if (y>5 && filename[y-1]=='f' && filename[y-2]=='f' && filename[y-3]=='i' && filename[y-4]=='t' && filename[y-5]=='.')
+		{
+			y-=5;
+			tif_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -4005,7 +4016,11 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		mapfile[x+1]='t'; mapfile[x+2]='i'; mapfile[x+3]='f';
+	}
+	else if (png_output)
 	{
 		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
 	}
@@ -4102,12 +4117,14 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 		fclose(fd);
 	}
 
-	/* PPM stays streamed (matches upstream byte-for-byte); PNG buffers the
-	   full frame and is written in one shot at the end via stb_image_write. */
+	/* PPM stays streamed (matches upstream byte-for-byte). PNG and GeoTIFF
+	   both buffer the full frame in a render::Image, then write in one shot
+	   at the end. */
+	const int buffered = png_output || tif_output;
 	render::Image *img = NULL;
 	fd = NULL;
 
-	if (png_output)
+	if (buffered)
 	{
 		img = new render::Image(width, height);
 	}
@@ -4118,7 +4135,8 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	}
 
 	fprintf(stdout,"\nWriting \"%s\" (%ux%u %s image)... ",
-	        mapfile, width, height, png_output ? "png" : "pixmap");
+	        mapfile, width, height,
+	        tif_output ? "geotiff" : png_output ? "png" : "pixmap");
 	fflush(stdout);
 
 	for (y=0, lat=north; y<(int)height; y++, lat=north-(dpp*(double)y))
@@ -4147,14 +4165,21 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 				/* We should never get here, but if we do display as black. */
 				c = render::Color{0, 0, 0};
 
-			if (png_output)
+			if (buffered)
 				img->set((unsigned)x, (unsigned)y, c);
 			else
 				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
 		}
 	}
 
-	if (png_output)
+	if (tif_output)
+	{
+		const render::GeoBounds bounds{north, south, east, west};
+		if (!render::write_geotiff(*img, mapfile, bounds))
+			fprintf(stderr, "\n*** ERROR: Failed to write GeoTIFF \"%s\"\n", mapfile);
+		delete img;
+	}
+	else if (png_output)
 	{
 		if (!render::write_png(*img, mapfile))
 			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
@@ -4349,6 +4374,7 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	unsigned char found;
 	int indx, x, y, colorwidth, x0, y0;
 	int png_output=0;  /* selected by .png extension on `filename` */
+	int tif_output=0;  /* selected by .tif or .tiff extension on `filename` */
 	double lat, lon, conversion, one_over_gamma,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -4382,6 +4408,16 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			y-=4;
 			png_output=1;
 		}
+		else if (filename[y-1]=='f' && filename[y-2]=='i' && filename[y-3]=='t' && filename[y-4]=='.')
+		{
+			y-=4;
+			tif_output=1;
+		}
+		else if (y>5 && filename[y-1]=='f' && filename[y-2]=='f' && filename[y-3]=='i' && filename[y-4]=='t' && filename[y-5]=='.')
+		{
+			y-=5;
+			tif_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -4395,7 +4431,11 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		mapfile[x+1]='t'; mapfile[x+2]='i'; mapfile[x+3]='f';
+	}
+	else if (png_output)
 	{
 		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
 	}
@@ -4418,7 +4458,11 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		ckfile[x+4]='t'; ckfile[x+5]='i'; ckfile[x+6]='f';
+	}
+	else if (png_output)
 	{
 		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
 	}
@@ -4435,7 +4479,7 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 
 	north=(double)max_north-dpp;
 
-	if (kml || geo)
+	if (kml || geo || tif_output)
 		south=(double)min_north;	/* No bottom legend */
 	else
 		south=(double)min_north-(30.0/ppd); /* 30 pixels for bottom legend */
@@ -4529,12 +4573,15 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	/* Total image height includes a 30-row legend strip below the map, except
 	   in KML/geo modes where the map is overlaid georeferenced and the legend
 	   is moved to a separate color-key sidecar (see further below). */
-	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	/* GeoTIFF, like KML/geo, suppresses the legend bar -- GIS readers want
+	   bare georeferenced data, not UI chrome stitched to the bottom rows. */
+	const unsigned legend_h = (kml || geo || tif_output) ? 0u : 30u;
 	const unsigned full_h   = height + legend_h;
+	const int buffered = png_output || tif_output;
 
 	render::Image *img = NULL;
 	fd = NULL;
-	if (png_output)
+	if (buffered)
 	{
 		img = new render::Image(width, full_h);
 	}
@@ -4545,7 +4592,8 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	}
 
 	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
-	        mapfile, width, full_h, png_output ? "png" : "pixmap");
+	        mapfile, width, full_h,
+	        tif_output ? "geotiff" : png_output ? "png" : "pixmap");
 	fflush(stdout);
 
 	/* Main map pixels (rows 0..height-1). */
@@ -4574,7 +4622,7 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			else
 				c = render::Color{0, 0, 0};  /* never expected, defensive */
 
-			if (png_output)
+			if (buffered)
 				img->set((unsigned)x, (unsigned)y, c);
 			else
 				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -4591,7 +4639,7 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			for (x0=0; x0<(int)width; x0++)
 			{
 				render::Color c = lr_legend_pixel(x0, y0, colorwidth);
-				if (png_output)
+				if (buffered)
 					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
 					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -4599,7 +4647,14 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		}
 	}
 
-	if (png_output)
+	if (tif_output)
+	{
+		const render::GeoBounds bounds{north, south, east, west};
+		if (!render::write_geotiff(*img, mapfile, bounds))
+			fprintf(stderr, "\n*** ERROR: Failed to write GeoTIFF \"%s\"\n", mapfile);
+		delete img;
+	}
+	else if (png_output)
 	{
 		if (!render::write_png(*img, mapfile))
 			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
@@ -4610,8 +4665,9 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		fclose(fd);
 	}
 
-
-	if (kml)
+	/* Color-key sidecar is a UI artifact (legend chrome), not georef'd data --
+	   skip it for GeoTIFF output. */
+	if (kml && !tif_output)
 	{
 		/* Color-key sidecar image (rendered to ckfile -- "<basename>-ck.{ppm|png}").
 		   Same per-pixel logic as the bottom legend, but laid out vertically:
@@ -4856,6 +4912,7 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	unsigned char found;
 	int indx, x, y, x0, y0, colorwidth;
 	int png_output=0;  /* selected by .png extension on `filename` */
+	int tif_output=0;  /* selected by .tif or .tiff extension on `filename` */
 	double conversion, one_over_gamma, lat, lon,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -4888,6 +4945,16 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			y-=4;
 			png_output=1;
 		}
+		else if (filename[y-1]=='f' && filename[y-2]=='i' && filename[y-3]=='t' && filename[y-4]=='.')
+		{
+			y-=4;
+			tif_output=1;
+		}
+		else if (y>5 && filename[y-1]=='f' && filename[y-2]=='f' && filename[y-3]=='i' && filename[y-4]=='t' && filename[y-5]=='.')
+		{
+			y-=5;
+			tif_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -4901,7 +4968,11 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		mapfile[x+1]='t'; mapfile[x+2]='i'; mapfile[x+3]='f';
+	}
+	else if (png_output)
 	{
 		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
 	}
@@ -4923,7 +4994,11 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		ckfile[x+4]='t'; ckfile[x+5]='i'; ckfile[x+6]='f';
+	}
+	else if (png_output)
 	{
 		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
 	}
@@ -4940,7 +5015,7 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 
 	north=(double)max_north-dpp;
 
-	if (kml || geo)
+	if (kml || geo || tif_output)
 		south=(double)min_north;	/* No bottom legend */
 	else
 		south=(double)min_north-(30.0/ppd);	/* 30 pixels for bottom legend */
@@ -5031,12 +5106,15 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		fclose(fd);
 	}
 
-	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	/* GeoTIFF, like KML/geo, suppresses the legend bar -- GIS readers want
+	   bare georeferenced data, not UI chrome stitched to the bottom rows. */
+	const unsigned legend_h = (kml || geo || tif_output) ? 0u : 30u;
 	const unsigned full_h   = height + legend_h;
+	const int buffered = png_output || tif_output;
 
 	render::Image *img = NULL;
 	fd = NULL;
-	if (png_output)
+	if (buffered)
 	{
 		img = new render::Image(width, full_h);
 	}
@@ -5047,7 +5125,8 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	}
 
 	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
-	        mapfile, width, full_h, png_output ? "png" : "pixmap");
+	        mapfile, width, full_h,
+	        tif_output ? "geotiff" : png_output ? "png" : "pixmap");
 	fflush(stdout);
 
 	/* Main map pixels. */
@@ -5076,7 +5155,7 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			else
 				c = render::Color{0, 0, 0};
 
-			if (png_output)
+			if (buffered)
 				img->set((unsigned)x, (unsigned)y, c);
 			else
 				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -5092,7 +5171,7 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 			for (x0=0; x0<(int)width; x0++)
 			{
 				render::Color c = ss_legend_pixel(x0, y0, colorwidth);
-				if (png_output)
+				if (buffered)
 					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
 					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -5100,7 +5179,14 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		}
 	}
 
-	if (png_output)
+	if (tif_output)
+	{
+		const render::GeoBounds bounds{north, south, east, west};
+		if (!render::write_geotiff(*img, mapfile, bounds))
+			fprintf(stderr, "\n*** ERROR: Failed to write GeoTIFF \"%s\"\n", mapfile);
+		delete img;
+	}
+	else if (png_output)
 	{
 		if (!render::write_png(*img, mapfile))
 			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
@@ -5111,7 +5197,9 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		fclose(fd);
 	}
 
-	if (kml)
+	/* Color-key sidecar is a UI artifact (legend chrome), not georef'd data --
+	   skip it for GeoTIFF output. */
+	if (kml && !tif_output)
 	{
 		/* Color-key sidecar image (writes ckfile). */
 		const unsigned ck_w = 100u;
@@ -5373,6 +5461,7 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	unsigned char found;
 	int indx, x, y, x0, y0, colorwidth;
 	int png_output=0;  /* selected by .png extension on `filename` */
+	int tif_output=0;  /* selected by .tif or .tiff extension on `filename` */
 	double conversion, one_over_gamma, lat, lon,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -5405,6 +5494,16 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 			y-=4;
 			png_output=1;
 		}
+		else if (filename[y-1]=='f' && filename[y-2]=='i' && filename[y-3]=='t' && filename[y-4]=='.')
+		{
+			y-=4;
+			tif_output=1;
+		}
+		else if (y>5 && filename[y-1]=='f' && filename[y-2]=='f' && filename[y-3]=='i' && filename[y-4]=='t' && filename[y-5]=='.')
+		{
+			y-=5;
+			tif_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -5418,7 +5517,11 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		mapfile[x+1]='t'; mapfile[x+2]='i'; mapfile[x+3]='f';
+	}
+	else if (png_output)
 	{
 		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
 	}
@@ -5440,7 +5543,11 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	if (png_output)
+	if (tif_output)
+	{
+		ckfile[x+4]='t'; ckfile[x+5]='i'; ckfile[x+6]='f';
+	}
+	else if (png_output)
 	{
 		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
 	}
@@ -5457,7 +5564,7 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 
 	north=(double)max_north-dpp;
 
-	if (kml || geo)
+	if (kml || geo || tif_output)
 		south=(double)min_north;	/* No bottom legend */
 	else
 		south=(double)min_north-(30.0/ppd);	/* 30 pixels for bottom legend */
@@ -5548,12 +5655,15 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 		fclose(fd);
 	}
 
-	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	/* GeoTIFF, like KML/geo, suppresses the legend bar -- GIS readers want
+	   bare georeferenced data, not UI chrome stitched to the bottom rows. */
+	const unsigned legend_h = (kml || geo || tif_output) ? 0u : 30u;
 	const unsigned full_h   = height + legend_h;
+	const int buffered = png_output || tif_output;
 
 	render::Image *img = NULL;
 	fd = NULL;
-	if (png_output)
+	if (buffered)
 	{
 		img = new render::Image(width, full_h);
 	}
@@ -5564,7 +5674,8 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	}
 
 	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
-	        mapfile, width, full_h, png_output ? "png" : "pixmap");
+	        mapfile, width, full_h,
+	        tif_output ? "geotiff" : png_output ? "png" : "pixmap");
 	fflush(stdout);
 
 	/* Main map pixels. */
@@ -5593,7 +5704,7 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 			else
 				c = render::Color{0, 0, 0};
 
-			if (png_output)
+			if (buffered)
 				img->set((unsigned)x, (unsigned)y, c);
 			else
 				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -5609,7 +5720,7 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 			for (x0=0; x0<(int)width; x0++)
 			{
 				render::Color c = dbm_legend_pixel(x0, y0, colorwidth);
-				if (png_output)
+				if (buffered)
 					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
 					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
@@ -5617,7 +5728,14 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 		}
 	}
 
-	if (png_output)
+	if (tif_output)
+	{
+		const render::GeoBounds bounds{north, south, east, west};
+		if (!render::write_geotiff(*img, mapfile, bounds))
+			fprintf(stderr, "\n*** ERROR: Failed to write GeoTIFF \"%s\"\n", mapfile);
+		delete img;
+	}
+	else if (png_output)
 	{
 		if (!render::write_png(*img, mapfile))
 			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
@@ -5628,7 +5746,9 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 		fclose(fd);
 	}
 
-	if (kml)
+	/* Color-key sidecar is a UI artifact (legend chrome), not georef'd data --
+	   skip it for GeoTIFF output. */
+	if (kml && !tif_output)
 	{
 		/* Color-key sidecar image (writes ckfile). */
 		const unsigned ck_w = 100u;
@@ -7757,7 +7877,7 @@ int main(int argc, char *argv[])
 		fprintf(stdout,"       -h filename of terrain height graph to plot\n");
 		fprintf(stdout,"       -H filename of normalized terrain height graph to plot\n");
 		fprintf(stdout,"       -l filename of path loss graph to plot\n");
-		fprintf(stdout,"       -o filename of topographic map to generate (.ppm or .png)\n");
+		fprintf(stdout,"       -o filename of topographic map to generate (.ppm, .png, or .tif)\n");
 		fprintf(stdout,"       -u filename of user-defined terrain file to import\n");
 		fprintf(stdout,"       -d sdf file directory path (overrides path in ~/.splat_path file)\n");
 		fprintf(stdout,"       -m earth radius multiplier\n");

@@ -41,10 +41,30 @@ private:
     std::vector<std::uint8_t> data_;
 };
 
+/* Geographic bounds for a raster image -- the same north/south/east/west
+   that the `.geo` sidecar carries, in WGS84 degrees.  East/west may be
+   negative (Western Hemisphere) or in the 0..360 range; the GeoTIFF writer
+   stores them verbatim so downstream GIS tools see exactly the bounds the
+   `.geo` file describes. */
+struct GeoBounds {
+    double north;
+    double south;
+    double east;
+    double west;
+};
+
 /* Writers ---------------------------------------------------------------- */
 
 /* Write `img` to `path` as an 8-bit RGB PNG.  Returns true on success. */
 bool write_png(const Image& img, const char* path);
+
+/* Write `img` to `path` as a WGS84 (EPSG:4326) GeoTIFF, with `bounds` mapped
+   to the image extents via a single tiepoint at (0,0) -> (west, north) plus
+   a pixel-scale derived from (east-west)/width and (north-south)/height.
+   The geo-key directory advertises ModelTypeGeographic + GCS_WGS_84, so any
+   GIS reader (QGIS, ArcGIS, GDAL, Leaflet+leaflet-geotiff, ...) will load
+   the image georeferenced.  Returns true on success. */
+bool write_geotiff(const Image& img, const char* path, const GeoBounds& bounds);
 
 }  // namespace render
 
