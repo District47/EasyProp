@@ -4168,19 +4168,187 @@ void WritePPM(char *filename, unsigned char geo, unsigned char kml, unsigned cha
 	fflush(stdout);
 }
 
+/* Per-pixel color for the path-loss map (WritePPMLR), extracted so the PPM
+   and PNG paths emit identical pixels.  Mirrors the original inline switch:
+   the signal[][] field is interpreted as Longley-Rice path loss, classified
+   into region.level[] bands (optionally smooth-interpolated), with the same
+   text-label / county-boundary / terrain-fallback rules as the legacy code. */
+static inline render::Color lr_pixel_color(int indx, int x0, int y0,
+                                           unsigned char ngs,
+                                           int min_elev,
+                                           double one_over_gamma,
+                                           double conversion)
+{
+	unsigned char mask = dem[indx].mask[x0][y0];
+	int loss = (int)dem[indx].signal[x0][y0];
+	unsigned red = 0, green = 0, blue = 0;
+	int match = 255;
+
+	if (loss <= region.level[0])
+		match = 0;
+	else
+	{
+		for (int z = 1; z < region.levels && match == 255; z++)
+			if (loss >= region.level[z - 1] && loss < region.level[z])
+				match = z;
+	}
+
+	if (match < region.levels)
+	{
+		if (smooth_contours && match > 0)
+		{
+			red   = (unsigned)interpolate(region.color[match-1][0], region.color[match][0],
+			                              region.level[match-1], region.level[match], loss);
+			green = (unsigned)interpolate(region.color[match-1][1], region.color[match][1],
+			                              region.level[match-1], region.level[match], loss);
+			blue  = (unsigned)interpolate(region.color[match-1][2], region.color[match][2],
+			                              region.level[match-1], region.level[match], loss);
+		}
+		else
+		{
+			red   = region.color[match][0];
+			green = region.color[match][1];
+			blue  = region.color[match][2];
+		}
+	}
+
+	if (mask & 2)
+	{
+		/* Text Labels: red, or inverted color if drawn over a red band. */
+		if (red >= 180 && green <= 75 && blue <= 75 && loss != 0)
+			return render::Color{(unsigned char)(255 ^ red),
+			                     (unsigned char)(255 ^ green),
+			                     (unsigned char)(255 ^ blue)};
+		return render::Color{255, 0, 0};
+	}
+
+	if (mask & 4)
+		return render::Color{0, 0, 0};  /* County Boundaries: Black */
+
+	if (loss == 0 || (contour_threshold != 0 && loss > abs(contour_threshold)))
+	{
+		if (ngs) return render::Color{255, 255, 255};
+		if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+		unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+		                                        one_over_gamma) * conversion);
+		unsigned char t = (unsigned char)terrain;
+		return render::Color{t, t, t};
+	}
+
+	if (red != 0 || green != 0 || blue != 0)
+		return render::Color{(unsigned char)red,
+		                     (unsigned char)green,
+		                     (unsigned char)blue};
+
+	/* Color band has no signal here -- fall back to terrain/sea-level. */
+	if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+	unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+	                                        one_over_gamma) * conversion);
+	unsigned char t = (unsigned char)terrain;
+	return render::Color{t, t, t};
+}
+
+/* Color of a single pixel in the contour-legend bar that's appended to the
+   bottom of the path-loss image (the 30-row strip with numeric labels like
+   "100dB"). `colorwidth` is the per-band column width.  Used identically by
+   the PPM and PNG paths.  The "indx=255 sentinel -> black text" trick is the
+   original code's way of overlaying font glyphs on the colored bands. */
+static inline render::Color lr_legend_pixel(int x0, int y0, int colorwidth)
+{
+	int indx  = x0 / colorwidth;
+	int x     = x0 % colorwidth;
+	int level = region.level[indx];
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	if (y0 >= 8 && y0 <= 23)
+	{
+		if (hundreds > 0)
+			if (x >= 11 && x <= 18)
+				if (fontdata[16*(hundreds+'0')+(y0-8)] & (128 >> (x-11)))
+					indx = 255;
+		if (tens > 0 || hundreds > 0)
+			if (x >= 19 && x <= 26)
+				if (fontdata[16*(tens+'0')+(y0-8)] & (128 >> (x-19)))
+					indx = 255;
+		if (x >= 27 && x <= 34)
+			if (fontdata[16*(units+'0')+(y0-8)] & (128 >> (x-27)))
+				indx = 255;
+		if (x >= 42 && x <= 49)
+			if (fontdata[16*('d')+(y0-8)] & (128 >> (x-42)))
+				indx = 255;
+		if (x >= 50 && x <= 57)
+			if (fontdata[16*('B')+(y0-8)] & (128 >> (x-50)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
+/* Color of a single pixel in the standalone color-key sidecar image (the
+   "-ck.ppm" / "-ck.png" file produced in KML mode).  Each level occupies a
+   30-row band stacked vertically; numeric "<N>dB" labels are font-rendered
+   in the same way as the bottom legend.  Used by both PPM and PNG paths. */
+static inline render::Color lr_colorkey_pixel(int x0, int y0)
+{
+	int indx  = y0 / 30;
+	int x     = x0;
+	int level = region.level[indx];
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	int yy = y0 % 30;
+	if (yy >= 8 && yy <= 23)
+	{
+		if (hundreds > 0)
+			if (x >= 11 && x <= 18)
+				if (fontdata[16*(hundreds+'0')+(yy-8)] & (128 >> (x-11)))
+					indx = 255;
+		if (tens > 0 || hundreds > 0)
+			if (x >= 19 && x <= 26)
+				if (fontdata[16*(tens+'0')+(yy-8)] & (128 >> (x-19)))
+					indx = 255;
+		if (x >= 27 && x <= 34)
+			if (fontdata[16*(units+'0')+(yy-8)] & (128 >> (x-27)))
+				indx = 255;
+		if (x >= 42 && x <= 49)
+			if (fontdata[16*('d')+(yy-8)] & (128 >> (x-42)))
+				indx = 255;
+		if (x >= 50 && x <= 57)
+			if (fontdata[16*('B')+(yy-8)] & (128 >> (x-50)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
 void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned char ngs, struct site *xmtr, unsigned char txsites)
 {
-	/* This function generates a topographic map in Portable Pix Map
-	   (PPM) format based on the content of flags held in the mask[][] 
-	   array (only).  The image created is rotated counter-clockwise
-	   90 degrees from its representation in dem[][] so that north
-	   points up and east points right in the image generated. */
+	/* Path-loss map writer. Same dispatch story as WritePPM(): the bytes are
+	   emitted by the per-pixel helpers above; this function just orchestrates
+	   the filename mangling, the .geo/.kml sidecars, the main image, the
+	   bottom legend bar, and (in KML mode) the standalone color-key file.
+	   PPM / PNG is chosen by the extension on `filename`. */
 
-	char mapfile[255], geofile[255], kmlfile[255],  ckfile[255];
-	unsigned width, height, red, green, blue, terrain=0;
-	unsigned char found, mask, cityorcounty; 
-	int indx, x, y, z, colorwidth, x0, y0, loss, level,
-	    hundreds, tens, units, match;
+	char mapfile[255], geofile[255], kmlfile[255], ckfile[255];
+	unsigned width, height;
+	unsigned char found;
+	int indx, x, y, colorwidth, x0, y0;
+	int png_output=0;  /* selected by .png extension on `filename` */
 	double lat, lon, conversion, one_over_gamma,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -4209,6 +4377,11 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	{
 		if (filename[y-1]=='m' && filename[y-2]=='p' && filename[y-3]=='p' && filename[y-4]=='.')
 			y-=4;
+		else if (filename[y-1]=='g' && filename[y-2]=='n' && filename[y-3]=='p' && filename[y-4]=='.')
+		{
+			y-=4;
+			png_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -4222,26 +4395,37 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	mapfile[x+1]='p';
+	if (png_output)
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
+	}
+	else
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='p'; mapfile[x+3]='m';
+	}
 	geofile[x+1]='g';
 	kmlfile[x+1]='k';
-	mapfile[x+2]='p';
 	geofile[x+2]='e';
 	kmlfile[x+2]='m';
-	mapfile[x+3]='m';
 	geofile[x+3]='o';
 	kmlfile[x+3]='l';
 	mapfile[x+4]=0;
 	geofile[x+4]=0;
 	kmlfile[x+4]=0;
 
+	/* "<basename>-ck.{ppm|png}" -- color-key sidecar for KML mode. */
 	ckfile[x]='-';
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	ckfile[x+4]='p';
-	ckfile[x+5]='p';
-	ckfile[x+6]='m';
+	if (png_output)
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
+	}
+	else
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='p'; ckfile[x+6]='m';
+	}
 	ckfile[x+7]=0;
 
 	minwest=((double)min_west)+dpp;
@@ -4342,26 +4526,29 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		fclose(fd);
 	}
 
-	fd=fopen(mapfile,"wb");
+	/* Total image height includes a 30-row legend strip below the map, except
+	   in KML/geo modes where the map is overlaid georeferenced and the legend
+	   is moved to a separate color-key sidecar (see further below). */
+	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	const unsigned full_h   = height + legend_h;
 
-	if (kml || geo)
+	render::Image *img = NULL;
+	fd = NULL;
+	if (png_output)
 	{
-		/* No bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height);
+		img = new render::Image(width, full_h);
 	}
-
 	else
 	{
-		/* Allow space for bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height+30);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height+30);
+		fd = fopen(mapfile, "wb");
+		fprintf(fd, "P6\n%u %u\n255\n", width, full_h);
 	}
 
+	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
+	        mapfile, width, full_h, png_output ? "png" : "pixmap");
 	fflush(stdout);
 
+	/* Main map pixels (rows 0..height-1). */
 	for (y=0, lat=north; y<(int)height; y++, lat=north-(dpp*(double)y))
 	{
 		for (x=0, lon=max_west; x<(int)width; x++, lon=max_west-(dpp*(double)x))
@@ -4380,286 +4567,295 @@ void WritePPMLR(char *filename, unsigned char geo, unsigned char kml, unsigned c
 					indx++;
 			}
 
+			render::Color c;
 			if (found)
-			{
-				mask=dem[indx].mask[x0][y0];
-				loss=(dem[indx].signal[x0][y0]);
-				cityorcounty=0;
-
-				match=255;
-
-				red=0;
-				green=0;
-				blue=0;
-
-				if (loss<=region.level[0])
-					match=0;
-				else
-				{
-					for (z=1; (z<region.levels && match==255); z++)
-					{
-						if (loss>=region.level[z-1] && loss<region.level[z])
-							match=z;
-					}
-				}
-
-				if (match<region.levels)
-				{
-					if (smooth_contours && match>0)
-					{
-						red=(unsigned)interpolate(region.color[match-1][0],region.color[match][0],region.level[match-1],region.level[match],loss);
-						green=(unsigned)interpolate(region.color[match-1][1],region.color[match][1],region.level[match-1],region.level[match],loss);
-						blue=(unsigned)interpolate(region.color[match-1][2],region.color[match][2],region.level[match-1],region.level[match],loss);
-					}
-
-					else
-					{
-						red=region.color[match][0];
-						green=region.color[match][1];
-						blue=region.color[match][2];
-					}
-				}
-
-	 			if (mask&2)
-				{
-					/* Text Labels: Red or otherwise */
-
-					if (red>=180 && green<=75 && blue<=75 && loss!=0)
-                                                fprintf(fd,"%c%c%c",255^red,255^green,255^blue);
-                                        else
-                                                fprintf(fd,"%c%c%c",255,0,0);
-
-                                        cityorcounty=1;
-				}
-
-				else if (mask&4)
-				{
-					/* County Boundaries: Black */
-
-					fprintf(fd,"%c%c%c",0,0,0);
-
-					cityorcounty=1;
-				}
-
-				if (cityorcounty==0)
-				{
-					if (loss==0 || (contour_threshold!=0 && loss>abs(contour_threshold)))
-					{
-						if (ngs)  /* No terrain */
-							fprintf(fd,"%c%c%c",255,255,255);
-						else
-						{
-							/* Display land or sea elevation */
-
-							if (dem[indx].data[x0][y0]==0)
-								fprintf(fd,"%c%c%c",0,0,170);
-							else
-							{
-								terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-								fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-							}
-						}
-					}
-
-					else
-					{
-						/* Plot path loss in color */
-
-						if (red!=0 || green!=0 || blue!=0)
-							fprintf(fd,"%c%c%c",red,green,blue);
-
-						else  /* terrain / sea-level */
-						{
-							if (dem[indx].data[x0][y0]==0)
-								fprintf(fd,"%c%c%c",0,0,170);
-							else
-							{
-								/* Elevation: Greyscale */
-								terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-								fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-							}
-						}
-					}
-				}
-			}
-
+				c = lr_pixel_color(indx, x0, y0, ngs,
+				                   min_elevation, one_over_gamma, conversion);
 			else
-			{
-				/* We should never get here, but if */
-				/* we do, display the region as black */
+				c = render::Color{0, 0, 0};  /* never expected, defensive */
 
-				fprintf(fd,"%c%c%c",0,0,0);
-			}
+			if (png_output)
+				img->set((unsigned)x, (unsigned)y, c);
+			else
+				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
 		}
 	}
 
-	if (kml==0 && geo==0)
+	/* Bottom legend strip (only when not emitting georeferenced output). */
+	if (legend_h > 0)
 	{
-		/* Display legend along bottom of image
-		 * if not generating .kml or .geo output.
-		 */
+		colorwidth = (int)rint((float)width / (float)region.levels);
 
-		colorwidth=(int)rint((float)width/(float)region.levels);
-
-		for (y0=0; y0<30; y0++)
+		for (y0=0; y0<(int)legend_h; y0++)
 		{
 			for (x0=0; x0<(int)width; x0++)
 			{
-				indx=x0/colorwidth;
-				x=x0%colorwidth;
-				level=region.level[indx];
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-		       		if (y0>=8 && y0<=23)
-				{  
-					if (hundreds>0)
-					{
-				  		if (x>=11 && x<=18)     
-				      			if (fontdata[16*(hundreds+'0')+(y0-8)]&(128>>(x-11)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (x>=19 && x<=26)     
-							if (fontdata[16*(tens+'0')+(y0-8)]&(128>>(x-19)))
-								indx=255;
-					}
- 
-					if (x>=27 && x<=34)
-						if (fontdata[16*(units+'0')+(y0-8)]&(128>>(x-27)))
-							indx=255;
-
-					if (x>=42 && x<=49)
-						if (fontdata[16*('d')+(y0-8)]&(128>>(x-42)))
-							indx=255;
-
-					if (x>=50 && x<=57)
-						if (fontdata[16*('B')+(y0-8)]&(128>>(x-50)))
-							indx=255;
-		       		}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
+				render::Color c = lr_legend_pixel(x0, y0, colorwidth);
+				if (png_output)
+					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
 		}
 	}
 
-	fclose(fd);
+	if (png_output)
+	{
+		if (!render::write_png(*img, mapfile))
+			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
+		delete img;
+	}
+	else
+	{
+		fclose(fd);
+	}
 
 
 	if (kml)
 	{
-		/* Write colorkey image file */
+		/* Color-key sidecar image (rendered to ckfile -- "<basename>-ck.{ppm|png}").
+		   Same per-pixel logic as the bottom legend, but laid out vertically:
+		   each level occupies a 30-row band stacked top-to-bottom. */
+		const unsigned ck_w = 100u;
+		const unsigned ck_h = (unsigned)(30 * region.levels);
 
-		fd=fopen(ckfile,"wb");
-
-		height=30*region.levels;
-		width=100;
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-
-		for (y0=0; y0<(int)height; y0++)
+		render::Image *ck_img = NULL;
+		fd = NULL;
+		if (png_output)
 		{
-			for (x0=0; x0<(int)width; x0++)
-			{
-				indx=y0/30;
-				x=x0;
-				level=region.level[indx];
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-				if ((y0%30)>=8 && (y0%30)<=23)
-				{  
-					if (hundreds>0)
-					{
-				  		if (x>=11 && x<=18)     
-				      			if (fontdata[16*(hundreds+'0')+((y0%30)-8)]&(128>>(x-11)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (x>=19 && x<=26)     
-							if (fontdata[16*(tens+'0')+((y0%30)-8)]&(128>>(x-19)))
-								indx=255;
-					}
- 
-					if (x>=27 && x<=34)
-						if (fontdata[16*(units+'0')+((y0%30)-8)]&(128>>(x-27)))
-							indx=255;
-
-					if (x>=42 && x<=49)
-						if (fontdata[16*('d')+((y0%30)-8)]&(128>>(x-42)))
-							indx=255;
-
-					if (x>=50 && x<=57)
-						if (fontdata[16*('B')+((y0%30)-8)]&(128>>(x-50)))
-							indx=255;
-		       		}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
-				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+			ck_img = new render::Image(ck_w, ck_h);
+		}
+		else
+		{
+			fd = fopen(ckfile, "wb");
+			fprintf(fd, "P6\n%u %u\n255\n", ck_w, ck_h);
 		}
 
-		fclose(fd);
+		for (y0=0; y0<(int)ck_h; y0++)
+		{
+			for (x0=0; x0<(int)ck_w; x0++)
+			{
+				render::Color c = lr_colorkey_pixel(x0, y0);
+				if (png_output)
+					ck_img->set((unsigned)x0, (unsigned)y0, c);
+				else
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
+		}
+
+		if (png_output)
+		{
+			if (!render::write_png(*ck_img, ckfile))
+				fprintf(stderr, "\n*** ERROR: Failed to write color-key PNG \"%s\"\n", ckfile);
+			delete ck_img;
+		}
+		else
+		{
+			fclose(fd);
+		}
 	}
 
 	fprintf(stdout,"Done!\n");
 	fflush(stdout);
 }
 
+/* Per-pixel color for the signal-strength map.  Same shape as lr_pixel_color
+   but the relationship between signal level and quality is inverted: a higher
+   signal[] value is better, so the level-array search runs descending and the
+   smooth-interpolation endpoints swap.  The signal[] field is offset by -100
+   relative to the field strength reported in the report (the legacy bias). */
+static inline render::Color ss_pixel_color(int indx, int x0, int y0,
+                                           unsigned char ngs,
+                                           int min_elev,
+                                           double one_over_gamma,
+                                           double conversion)
+{
+	unsigned char mask = dem[indx].mask[x0][y0];
+	int signal = (int)dem[indx].signal[x0][y0] - 100;
+	unsigned red = 0, green = 0, blue = 0;
+	int match = 255;
+
+	if (signal >= region.level[0])
+		match = 0;
+	else
+	{
+		for (int z = 1; z < region.levels && match == 255; z++)
+			if (signal < region.level[z - 1] && signal >= region.level[z])
+				match = z;
+	}
+
+	if (match < region.levels)
+	{
+		if (smooth_contours && match > 0)
+		{
+			red   = (unsigned)interpolate(region.color[match][0], region.color[match-1][0],
+			                              region.level[match], region.level[match-1], signal);
+			green = (unsigned)interpolate(region.color[match][1], region.color[match-1][1],
+			                              region.level[match], region.level[match-1], signal);
+			blue  = (unsigned)interpolate(region.color[match][2], region.color[match-1][2],
+			                              region.level[match], region.level[match-1], signal);
+		}
+		else
+		{
+			red   = region.color[match][0];
+			green = region.color[match][1];
+			blue  = region.color[match][2];
+		}
+	}
+
+	if (mask & 2)
+	{
+		if (red >= 180 && green <= 75 && blue <= 75)
+			return render::Color{(unsigned char)(255 ^ red),
+			                     (unsigned char)(255 ^ green),
+			                     (unsigned char)(255 ^ blue)};
+		return render::Color{255, 0, 0};
+	}
+
+	if (mask & 4)
+		return render::Color{0, 0, 0};
+
+	if (contour_threshold != 0 && signal < contour_threshold)
+	{
+		if (ngs) return render::Color{255, 255, 255};
+		if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+		unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+		                                        one_over_gamma) * conversion);
+		unsigned char t = (unsigned char)terrain;
+		return render::Color{t, t, t};
+	}
+
+	if (red != 0 || green != 0 || blue != 0)
+		return render::Color{(unsigned char)red,
+		                     (unsigned char)green,
+		                     (unsigned char)blue};
+
+	if (ngs) return render::Color{255, 255, 255};
+	if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+	unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+	                                        one_over_gamma) * conversion);
+	unsigned char t = (unsigned char)terrain;
+	return render::Color{t, t, t};
+}
+
+/* SS bottom legend pixel. Labels read "<N>dB(microV/m)" so the font-glyph
+   column ranges are wider and shifted earlier than the LR legend's "<N>dB". */
+static inline render::Color ss_legend_pixel(int x0, int y0, int colorwidth)
+{
+	int indx  = x0 / colorwidth;
+	int x     = x0 % colorwidth;
+	int level = region.level[indx];
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	if (y0 >= 8 && y0 <= 23)
+	{
+		if (hundreds > 0)
+			if (x >= 5 && x <= 12)
+				if (fontdata[16*(hundreds+'0')+(y0-8)] & (128 >> (x-5)))
+					indx = 255;
+		if (tens > 0 || hundreds > 0)
+			if (x >= 13 && x <= 20)
+				if (fontdata[16*(tens+'0')+(y0-8)] & (128 >> (x-13)))
+					indx = 255;
+		if (x >= 21 && x <= 28)
+			if (fontdata[16*(units+'0')+(y0-8)] & (128 >> (x-21)))
+				indx = 255;
+		if (x >= 36 && x <= 43)
+			if (fontdata[16*('d')+(y0-8)] & (128 >> (x-36)))
+				indx = 255;
+		if (x >= 44 && x <= 51)
+			if (fontdata[16*('B')+(y0-8)] & (128 >> (x-44)))
+				indx = 255;
+		if (x >= 52 && x <= 59)
+			if (fontdata[16*(230)+(y0-8)] & (128 >> (x-52)))     /* µ (mu) */
+				indx = 255;
+		if (x >= 60 && x <= 67)
+			if (fontdata[16*('V')+(y0-8)] & (128 >> (x-60)))
+				indx = 255;
+		if (x >= 68 && x <= 75)
+			if (fontdata[16*('/')+(y0-8)] & (128 >> (x-68)))
+				indx = 255;
+		if (x >= 76 && x <= 83)
+			if (fontdata[16*('m')+(y0-8)] & (128 >> (x-76)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
+/* SS standalone color-key sidecar pixel.  Same glyph layout as ss_legend_pixel
+   but laid out vertically (each level = a 30-row band, stacked). */
+static inline render::Color ss_colorkey_pixel(int x0, int y0)
+{
+	int indx  = y0 / 30;
+	int x     = x0;
+	int level = region.level[indx];
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	int yy = y0 % 30;
+	if (yy >= 8 && yy <= 23)
+	{
+		if (hundreds > 0)
+			if (x >= 5 && x <= 12)
+				if (fontdata[16*(hundreds+'0')+(yy-8)] & (128 >> (x-5)))
+					indx = 255;
+		if (tens > 0 || hundreds > 0)
+			if (x >= 13 && x <= 20)
+				if (fontdata[16*(tens+'0')+(yy-8)] & (128 >> (x-13)))
+					indx = 255;
+		if (x >= 21 && x <= 28)
+			if (fontdata[16*(units+'0')+(yy-8)] & (128 >> (x-21)))
+				indx = 255;
+		if (x >= 36 && x <= 43)
+			if (fontdata[16*('d')+(yy-8)] & (128 >> (x-36)))
+				indx = 255;
+		if (x >= 44 && x <= 51)
+			if (fontdata[16*('B')+(yy-8)] & (128 >> (x-44)))
+				indx = 255;
+		if (x >= 52 && x <= 59)
+			if (fontdata[16*(230)+(yy-8)] & (128 >> (x-52)))
+				indx = 255;
+		if (x >= 60 && x <= 67)
+			if (fontdata[16*('V')+(yy-8)] & (128 >> (x-60)))
+				indx = 255;
+		if (x >= 68 && x <= 75)
+			if (fontdata[16*('/')+(yy-8)] & (128 >> (x-68)))
+				indx = 255;
+		if (x >= 76 && x <= 83)
+			if (fontdata[16*('m')+(yy-8)] & (128 >> (x-76)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
 void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned char ngs, struct site *xmtr, unsigned char txsites)
 {
-	/* This function generates a topographic map in Portable Pix Map
-	   (PPM) format based on the signal strength values held in the
-	   signal[][] array.  The image created is rotated counter-clockwise
-	   90 degrees from its representation in dem[][] so that north
-	   points up and east points right in the image generated. */
+	/* Signal-strength map writer. Mirrors WritePPMLR(): per-pixel helpers
+	   above produce identical bytes whether streamed to PPM or buffered for
+	   PNG. PPM / PNG selected by the extension on `filename`. */
 
 	char mapfile[255], geofile[255], kmlfile[255], ckfile[255];
-	unsigned width, height, terrain, red, green, blue;
-	unsigned char found, mask, cityorcounty;
-	int indx, x, y, z=1, x0, y0, signal, level, hundreds,
-	    tens, units, match, colorwidth;
+	unsigned width, height;
+	unsigned char found;
+	int indx, x, y, x0, y0, colorwidth;
+	int png_output=0;  /* selected by .png extension on `filename` */
 	double conversion, one_over_gamma, lat, lon,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -4687,6 +4883,11 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	{
 		if (filename[y-1]=='m' && filename[y-2]=='p' && filename[y-3]=='p' && filename[y-4]=='.')
 			y-=4;
+		else if (filename[y-1]=='g' && filename[y-2]=='n' && filename[y-3]=='p' && filename[y-4]=='.')
+		{
+			y-=4;
+			png_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -4700,13 +4901,18 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	mapfile[x+1]='p';
+	if (png_output)
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
+	}
+	else
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='p'; mapfile[x+3]='m';
+	}
 	geofile[x+1]='g';
 	kmlfile[x+1]='k';
-	mapfile[x+2]='p';
 	geofile[x+2]='e';
 	kmlfile[x+2]='m';
-	mapfile[x+3]='m';
 	geofile[x+3]='o';
 	kmlfile[x+3]='l';
 	mapfile[x+4]=0;
@@ -4717,9 +4923,14 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	ckfile[x+4]='p';
-	ckfile[x+5]='p';
-	ckfile[x+6]='m';
+	if (png_output)
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
+	}
+	else
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='p'; ckfile[x+6]='m';
+	}
 	ckfile[x+7]=0;
 
 	minwest=((double)min_west)+dpp;
@@ -4820,26 +5031,26 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 		fclose(fd);
 	}
 
-	fd=fopen(mapfile,"wb");
+	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	const unsigned full_h   = height + legend_h;
 
-	if (kml || geo)
+	render::Image *img = NULL;
+	fd = NULL;
+	if (png_output)
 	{
-		/* No bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height);
+		img = new render::Image(width, full_h);
 	}
-
 	else
 	{
-		/* Allow space for bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height+30);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height+30);
+		fd = fopen(mapfile, "wb");
+		fprintf(fd, "P6\n%u %u\n255\n", width, full_h);
 	}
 
+	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
+	        mapfile, width, full_h, png_output ? "png" : "pixmap");
 	fflush(stdout);
 
+	/* Main map pixels. */
 	for (y=0, lat=north; y<(int)height; y++, lat=north-(dpp*(double)y))
 	{
 		for (x=0, lon=max_west; x<(int)width; x++, lon=max_west-(dpp*(double)x))
@@ -4858,322 +5069,310 @@ void WritePPMSS(char *filename, unsigned char geo, unsigned char kml, unsigned c
 					indx++;
 			}
 
+			render::Color c;
 			if (found)
-			{
-				mask=dem[indx].mask[x0][y0];
-				signal=(dem[indx].signal[x0][y0])-100;
-				cityorcounty=0;
-
-				match=255;
-
-				red=0;
-				green=0;
-				blue=0;
-
-				if (signal>=region.level[0])
-					match=0;
-				else
-				{
-					for (z=1; (z<region.levels && match==255); z++)
-					{
-						if (signal<region.level[z-1] && signal>=region.level[z])
-							match=z;
-					}
-				}
-
-				if (match<region.levels)
-				{
-					if (smooth_contours && match>0)
-					{
-						red=(unsigned)interpolate(region.color[match][0],region.color[match-1][0],region.level[match],region.level[match-1],signal);
-						green=(unsigned)interpolate(region.color[match][1],region.color[match-1][1],region.level[match],region.level[match-1],signal);
-						blue=(unsigned)interpolate(region.color[match][2],region.color[match-1][2],region.level[match],region.level[match-1],signal);
-					}
-
-					else
-					{
-						red=region.color[match][0];
-						green=region.color[match][1];
-						blue=region.color[match][2];
-					}
-				}
-
-	 			if (mask&2) 
-				{
-					/* Text Labels: Red or otherwise */
-
-					if (red>=180 && green<=75 && blue<=75)
-						fprintf(fd,"%c%c%c",255^red,255^green,255^blue);
-					else
-						fprintf(fd,"%c%c%c",255,0,0);
-
-					cityorcounty=1;
-				}
-
-				else if (mask&4)
-				{
-					/* County Boundaries: Black */
-
-					fprintf(fd,"%c%c%c",0,0,0);
-
-					cityorcounty=1;
-				}
-
-				if (cityorcounty==0)
-				{
-					if (contour_threshold!=0 && signal<contour_threshold)
-					{
-						if (ngs)
-							fprintf(fd,"%c%c%c",255,255,255);
-						else
-						{
-							/* Display land or sea elevation */
-
-							if (dem[indx].data[x0][y0]==0)
-								fprintf(fd,"%c%c%c",0,0,170);
-							else
-							{
-								terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-								fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-							}
-						}
-					}
-
-					else
-					{
-						/* Plot field strength regions in color */
-
-						if (red!=0 || green!=0 || blue!=0)
-							fprintf(fd,"%c%c%c",red,green,blue);
-
-						else  /* terrain / sea-level */
-						{
-							if (ngs)
-								fprintf(fd,"%c%c%c",255,255,255);
-							else
-							{
-								if (dem[indx].data[x0][y0]==0)
-									fprintf(fd,"%c%c%c",0,0,170);
-								else
-								{
-									/* Elevation: Greyscale */
-									terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-									fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-								}
-							}
-						}
-					}
-				}
-			}
-
+				c = ss_pixel_color(indx, x0, y0, ngs,
+				                   min_elevation, one_over_gamma, conversion);
 			else
-			{
-				/* We should never get here, but if */
-				/* we do, display the region as black */
+				c = render::Color{0, 0, 0};
 
-				fprintf(fd,"%c%c%c",0,0,0);
-			}
+			if (png_output)
+				img->set((unsigned)x, (unsigned)y, c);
+			else
+				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
 		}
 	}
 
-	if (kml==0 && geo==0)
+	/* Bottom legend bar (skipped in georeferenced modes). */
+	if (legend_h > 0)
 	{
-		/* Display legend along bottom of image
-		 * if not generating .kml or .geo output.
-		 */
-
-		colorwidth=(int)rint((float)width/(float)region.levels);
-
-		for (y0=0; y0<30; y0++)
+		colorwidth = (int)rint((float)width / (float)region.levels);
+		for (y0=0; y0<(int)legend_h; y0++)
 		{
 			for (x0=0; x0<(int)width; x0++)
 			{
-				indx=x0/colorwidth;
-				x=x0%colorwidth;
-				level=region.level[indx];
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-		       		if (y0>=8 && y0<=23)
-				{  
-					if (hundreds>0)
-					{
-				  		if (x>=5 && x<=12)     
-				      			if (fontdata[16*(hundreds+'0')+(y0-8)]&(128>>(x-5)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (x>=13 && x<=20)     
-							if (fontdata[16*(tens+'0')+(y0-8)]&(128>>(x-13)))
-								indx=255;
-					}
- 
-					if (x>=21 && x<=28)
-						if (fontdata[16*(units+'0')+(y0-8)]&(128>>(x-21)))
-							indx=255;
-
-					if (x>=36 && x<=43)
-						if (fontdata[16*('d')+(y0-8)]&(128>>(x-36)))
-							indx=255;
-
-					if (x>=44 && x<=51)
-						if (fontdata[16*('B')+(y0-8)]&(128>>(x-44)))
-							indx=255;
-
-					if (x>=52 && x<=59)
-						if (fontdata[16*(230)+(y0-8)]&(128>>(x-52)))
-							indx=255;
-
-					if (x>=60 && x<=67)
-						if (fontdata[16*('V')+(y0-8)]&(128>>(x-60)))
-							indx=255;
-
-					if (x>=68 && x<=75)
-						if (fontdata[16*('/')+(y0-8)]&(128>>(x-68)))
-							indx=255;
-
-					if (x>=76 && x<=83)
-						if (fontdata[16*('m')+(y0-8)]&(128>>(x-76)))
-							indx=255;
-		       		}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
+				render::Color c = ss_legend_pixel(x0, y0, colorwidth);
+				if (png_output)
+					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
 		}
 	}
 
-	fclose(fd);
+	if (png_output)
+	{
+		if (!render::write_png(*img, mapfile))
+			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
+		delete img;
+	}
+	else
+	{
+		fclose(fd);
+	}
 
 	if (kml)
 	{
-		/* Write colorkey image file */
+		/* Color-key sidecar image (writes ckfile). */
+		const unsigned ck_w = 100u;
+		const unsigned ck_h = (unsigned)(30 * region.levels);
 
-		fd=fopen(ckfile,"wb");
-
-		height=30*region.levels;
-		width=100;
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-
-		for (y0=0; y0<(int)height; y0++)
+		render::Image *ck_img = NULL;
+		fd = NULL;
+		if (png_output)
 		{
-			for (x0=0; x0<(int)width; x0++)
-			{
-				indx=y0/30;
-				x=x0;
-				level=region.level[indx];
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-				if ((y0%30)>=8 && (y0%30)<=23)
-				{  
-					if (hundreds>0)
-					{
-				  		if (x>=5 && x<=12)     
-				      			if (fontdata[16*(hundreds+'0')+((y0%30)-8)]&(128>>(x-5)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (x>=13 && x<=20)     
-							if (fontdata[16*(tens+'0')+((y0%30)-8)]&(128>>(x-13)))
-								indx=255;
-					}
- 
-					if (x>=21 && x<=28)
-						if (fontdata[16*(units+'0')+((y0%30)-8)]&(128>>(x-21)))
-							indx=255;
-
-					if (x>=36 && x<=43)
-						if (fontdata[16*('d')+((y0%30)-8)]&(128>>(x-36)))
-							indx=255;
-
-					if (x>=44 && x<=51)
-						if (fontdata[16*('B')+((y0%30)-8)]&(128>>(x-44)))
-							indx=255;
-
-					if (x>=52 && x<=59)
-						if (fontdata[16*(230)+((y0%30)-8)]&(128>>(x-52)))
-							indx=255;
-
-					if (x>=60 && x<=67)
-						if (fontdata[16*('V')+((y0%30)-8)]&(128>>(x-60)))
-							indx=255;
-
-					if (x>=68 && x<=75)
-						if (fontdata[16*('/')+((y0%30)-8)]&(128>>(x-68)))
-							indx=255;
-
-					if (x>=76 && x<=83)
-						if (fontdata[16*('m')+((y0%30)-8)]&(128>>(x-76)))
-							indx=255;
-		       		}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
-				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+			ck_img = new render::Image(ck_w, ck_h);
+		}
+		else
+		{
+			fd = fopen(ckfile, "wb");
+			fprintf(fd, "P6\n%u %u\n255\n", ck_w, ck_h);
 		}
 
-		fclose(fd);
+		for (y0=0; y0<(int)ck_h; y0++)
+		{
+			for (x0=0; x0<(int)ck_w; x0++)
+			{
+				render::Color c = ss_colorkey_pixel(x0, y0);
+				if (png_output)
+					ck_img->set((unsigned)x0, (unsigned)y0, c);
+				else
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
+		}
+
+		if (png_output)
+		{
+			if (!render::write_png(*ck_img, ckfile))
+				fprintf(stderr, "\n*** ERROR: Failed to write color-key PNG \"%s\"\n", ckfile);
+			delete ck_img;
+		}
+		else
+		{
+			fclose(fd);
+		}
 	}
 
 	fprintf(stdout,"Done!\n");
 	fflush(stdout);
 }
 
+/* Per-pixel color for the dBm signal-power map.  Almost identical to
+   ss_pixel_color, but the signal[] field is offset by -200 (the legacy bias
+   for dBm encoding) and the text-label exemption requires dBm != 0. */
+static inline render::Color dbm_pixel_color(int indx, int x0, int y0,
+                                            unsigned char ngs,
+                                            int min_elev,
+                                            double one_over_gamma,
+                                            double conversion)
+{
+	unsigned char mask = dem[indx].mask[x0][y0];
+	int dBm = (int)dem[indx].signal[x0][y0] - 200;
+	unsigned red = 0, green = 0, blue = 0;
+	int match = 255;
+
+	if (dBm >= region.level[0])
+		match = 0;
+	else
+	{
+		for (int z = 1; z < region.levels && match == 255; z++)
+			if (dBm < region.level[z - 1] && dBm >= region.level[z])
+				match = z;
+	}
+
+	if (match < region.levels)
+	{
+		if (smooth_contours && match > 0)
+		{
+			red   = (unsigned)interpolate(region.color[match][0], region.color[match-1][0],
+			                              region.level[match], region.level[match-1], dBm);
+			green = (unsigned)interpolate(region.color[match][1], region.color[match-1][1],
+			                              region.level[match], region.level[match-1], dBm);
+			blue  = (unsigned)interpolate(region.color[match][2], region.color[match-1][2],
+			                              region.level[match], region.level[match-1], dBm);
+		}
+		else
+		{
+			red   = region.color[match][0];
+			green = region.color[match][1];
+			blue  = region.color[match][2];
+		}
+	}
+
+	if (mask & 2)
+	{
+		if (red >= 180 && green <= 75 && blue <= 75 && dBm != 0)
+			return render::Color{(unsigned char)(255 ^ red),
+			                     (unsigned char)(255 ^ green),
+			                     (unsigned char)(255 ^ blue)};
+		return render::Color{255, 0, 0};
+	}
+
+	if (mask & 4)
+		return render::Color{0, 0, 0};
+
+	if (contour_threshold != 0 && dBm < contour_threshold)
+	{
+		if (ngs) return render::Color{255, 255, 255};
+		if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+		unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+		                                        one_over_gamma) * conversion);
+		unsigned char t = (unsigned char)terrain;
+		return render::Color{t, t, t};
+	}
+
+	if (red != 0 || green != 0 || blue != 0)
+		return render::Color{(unsigned char)red,
+		                     (unsigned char)green,
+		                     (unsigned char)blue};
+
+	if (ngs) return render::Color{255, 255, 255};
+	if (dem[indx].data[x0][y0] == 0) return render::Color{0, 0, 170};
+	unsigned terrain = (unsigned)(0.5 + pow((double)(dem[indx].data[x0][y0] - min_elev),
+	                                        one_over_gamma) * conversion);
+	unsigned char t = (unsigned char)terrain;
+	return render::Color{t, t, t};
+}
+
+/* DBM legend pixel: labels read "+NNNdBm" or "-NNNdBm".  The sign occupies
+   the column slot immediately left of the leading nonzero digit, so its
+   position shifts based on whether hundreds/tens/units is the first digit. */
+static inline render::Color dbm_legend_pixel(int x0, int y0, int colorwidth)
+{
+	int indx  = x0 / colorwidth;
+	int x     = x0 % colorwidth;
+	int level = abs(region.level[indx]);
+	int sign_glyph = (region.level[indx] < 0) ? '-' : '+';
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	if (y0 >= 8 && y0 <= 23)
+	{
+		if (hundreds > 0)
+		{
+			if (x >= 5 && x <= 12)
+				if (fontdata[16*sign_glyph+(y0-8)] & (128 >> (x-5)))
+					indx = 255;
+			if (x >= 13 && x <= 20)
+				if (fontdata[16*(hundreds+'0')+(y0-8)] & (128 >> (x-13)))
+					indx = 255;
+		}
+
+		if (tens > 0 || hundreds > 0)
+		{
+			if (hundreds == 0)
+				if (x >= 13 && x <= 20)
+					if (fontdata[16*sign_glyph+(y0-8)] & (128 >> (x-13)))
+						indx = 255;
+			if (x >= 21 && x <= 28)
+				if (fontdata[16*(tens+'0')+(y0-8)] & (128 >> (x-21)))
+					indx = 255;
+		}
+
+		if (hundreds == 0 && tens == 0)
+			if (x >= 21 && x <= 28)
+				if (fontdata[16*sign_glyph+(y0-8)] & (128 >> (x-21)))
+					indx = 255;
+
+		if (x >= 29 && x <= 36)
+			if (fontdata[16*(units+'0')+(y0-8)] & (128 >> (x-29)))
+				indx = 255;
+		if (x >= 37 && x <= 44)
+			if (fontdata[16*('d')+(y0-8)] & (128 >> (x-37)))
+				indx = 255;
+		if (x >= 45 && x <= 52)
+			if (fontdata[16*('B')+(y0-8)] & (128 >> (x-45)))
+				indx = 255;
+		if (x >= 53 && x <= 60)
+			if (fontdata[16*('m')+(y0-8)] & (128 >> (x-53)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
+/* DBM standalone color-key pixel: same logic as dbm_legend_pixel but laid
+   out vertically (each level = a 30-row band, y%30 indexes within the band). */
+static inline render::Color dbm_colorkey_pixel(int x0, int y0)
+{
+	int indx  = y0 / 30;
+	int x     = x0;
+	int level = abs(region.level[indx]);
+	int sign_glyph = (region.level[indx] < 0) ? '-' : '+';
+
+	int hundreds = level / 100;
+	if (hundreds > 0) level -= hundreds * 100;
+	int tens = level / 10;
+	if (tens > 0) level -= tens * 10;
+	int units = level;
+
+	int yy = y0 % 30;
+	if (yy >= 8 && yy <= 23)
+	{
+		if (hundreds > 0)
+		{
+			if (x >= 5 && x <= 12)
+				if (fontdata[16*sign_glyph+(yy-8)] & (128 >> (x-5)))
+					indx = 255;
+			if (x >= 13 && x <= 20)
+				if (fontdata[16*(hundreds+'0')+(yy-8)] & (128 >> (x-13)))
+					indx = 255;
+		}
+
+		if (tens > 0 || hundreds > 0)
+		{
+			if (hundreds == 0)
+				if (x >= 13 && x <= 20)
+					if (fontdata[16*sign_glyph+(yy-8)] & (128 >> (x-13)))
+						indx = 255;
+			if (x >= 21 && x <= 28)
+				if (fontdata[16*(tens+'0')+(yy-8)] & (128 >> (x-21)))
+					indx = 255;
+		}
+
+		if (hundreds == 0 && tens == 0)
+			if (x >= 21 && x <= 28)
+				if (fontdata[16*sign_glyph+(yy-8)] & (128 >> (x-21)))
+					indx = 255;
+
+		if (x >= 29 && x <= 36)
+			if (fontdata[16*(units+'0')+(yy-8)] & (128 >> (x-29)))
+				indx = 255;
+		if (x >= 37 && x <= 44)
+			if (fontdata[16*('d')+(yy-8)] & (128 >> (x-37)))
+				indx = 255;
+		if (x >= 45 && x <= 52)
+			if (fontdata[16*('B')+(yy-8)] & (128 >> (x-45)))
+				indx = 255;
+		if (x >= 53 && x <= 60)
+			if (fontdata[16*('m')+(yy-8)] & (128 >> (x-53)))
+				indx = 255;
+	}
+
+	if (indx > region.levels) return render::Color{0, 0, 0};
+	return render::Color{(unsigned char)region.color[indx][0],
+	                     (unsigned char)region.color[indx][1],
+	                     (unsigned char)region.color[indx][2]};
+}
+
 void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned char ngs, struct site *xmtr, unsigned char txsites)
 {
-	/* This function generates a topographic map in Portable Pix Map
-	   (PPM) format based on the signal power level values held in the
-	   signal[][] array.  The image created is rotated counter-clockwise
-	   90 degrees from its representation in dem[][] so that north
-	   points up and east points right in the image generated. */
+	/* dBm signal-power-level map writer.  Same dispatch story as the other
+	   three writers; per-pixel helpers above produce identical bytes for
+	   PPM and PNG.  PPM / PNG selected by the extension on `filename`. */
 
 	char mapfile[255], geofile[255], kmlfile[255], ckfile[255];
-	unsigned width, height, terrain, red, green, blue;
-	unsigned char found, mask, cityorcounty;
-	int indx, x, y, z=1, x0, y0, dBm, level, hundreds,
-	    tens, units, match, colorwidth;
+	unsigned width, height;
+	unsigned char found;
+	int indx, x, y, x0, y0, colorwidth;
+	int png_output=0;  /* selected by .png extension on `filename` */
 	double conversion, one_over_gamma, lat, lon,
 	north, south, east, west, minwest;
 	FILE *fd;
@@ -5201,6 +5400,11 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	{
 		if (filename[y-1]=='m' && filename[y-2]=='p' && filename[y-3]=='p' && filename[y-4]=='.')
 			y-=4;
+		else if (filename[y-1]=='g' && filename[y-2]=='n' && filename[y-3]=='p' && filename[y-4]=='.')
+		{
+			y-=4;
+			png_output=1;
+		}
 	}
 
 	for (x=0; x<y; x++)
@@ -5214,13 +5418,18 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	mapfile[x]='.';
 	geofile[x]='.';
 	kmlfile[x]='.';
-	mapfile[x+1]='p';
+	if (png_output)
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='n'; mapfile[x+3]='g';
+	}
+	else
+	{
+		mapfile[x+1]='p'; mapfile[x+2]='p'; mapfile[x+3]='m';
+	}
 	geofile[x+1]='g';
 	kmlfile[x+1]='k';
-	mapfile[x+2]='p';
 	geofile[x+2]='e';
 	kmlfile[x+2]='m';
-	mapfile[x+3]='m';
 	geofile[x+3]='o';
 	kmlfile[x+3]='l';
 	mapfile[x+4]=0;
@@ -5231,9 +5440,14 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 	ckfile[x+1]='c';
 	ckfile[x+2]='k';
 	ckfile[x+3]='.';
-	ckfile[x+4]='p';
-	ckfile[x+5]='p';
-	ckfile[x+6]='m';
+	if (png_output)
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='n'; ckfile[x+6]='g';
+	}
+	else
+	{
+		ckfile[x+4]='p'; ckfile[x+5]='p'; ckfile[x+6]='m';
+	}
 	ckfile[x+7]=0;
 
 	minwest=((double)min_west)+dpp;
@@ -5334,26 +5548,26 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 		fclose(fd);
 	}
 
-	fd=fopen(mapfile,"wb");
+	const unsigned legend_h = (kml || geo) ? 0u : 30u;
+	const unsigned full_h   = height + legend_h;
 
-	if (kml || geo)
+	render::Image *img = NULL;
+	fd = NULL;
+	if (png_output)
 	{
-		/* No bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height);
+		img = new render::Image(width, full_h);
 	}
-
 	else
 	{
-		/* Allow for bottom legend */
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height+30);
-		fprintf(stdout,"\nWriting \"%s\" (%ux%u pixmap image)... ",mapfile,width,height+30);
+		fd = fopen(mapfile, "wb");
+		fprintf(fd, "P6\n%u %u\n255\n", width, full_h);
 	}
 
+	fprintf(stdout, "\nWriting \"%s\" (%ux%u %s image)... ",
+	        mapfile, width, full_h, png_output ? "png" : "pixmap");
 	fflush(stdout);
 
+	/* Main map pixels. */
 	for (y=0, lat=north; y<(int)height; y++, lat=north-(dpp*(double)y))
 	{
 		for (x=0, lon=max_west; x<(int)width; x++, lon=max_west-(dpp*(double)x))
@@ -5372,379 +5586,88 @@ void WritePPMDBM(char *filename, unsigned char geo, unsigned char kml, unsigned 
 					indx++;
 			}
 
+			render::Color c;
 			if (found)
-			{
-				mask=dem[indx].mask[x0][y0];
-				dBm=(dem[indx].signal[x0][y0])-200;
-				cityorcounty=0;
-
-				match=255;
-
-				red=0;
-				green=0;
-				blue=0;
-
-				if (dBm>=region.level[0])
-					match=0;
-				else
-				{
-					for (z=1; (z<region.levels && match==255); z++)
-					{
-						if (dBm<region.level[z-1] && dBm>=region.level[z])
-							match=z;
-					}
-				}
-
-				if (match<region.levels)
-				{
-					if (smooth_contours && match>0)
-					{
-						red=(unsigned)interpolate(region.color[match][0],region.color[match-1][0],region.level[match],region.level[match-1],dBm);
-						green=(unsigned)interpolate(region.color[match][1],region.color[match-1][1],region.level[match],region.level[match-1],dBm);
-						blue=(unsigned)interpolate(region.color[match][2],region.color[match-1][2],region.level[match],region.level[match-1],dBm);
-					}
-
-					else
-					{
-						red=region.color[match][0];
-						green=region.color[match][1];
-						blue=region.color[match][2];
-					}
-				}
-
-	 			if (mask&2) 
-				{
-					/* Text Labels: Red or otherwise */
-
-					if (red>=180 && green<=75 && blue<=75 && dBm!=0)
-						fprintf(fd,"%c%c%c",255^red,255^green,255^blue);
-					else
-						fprintf(fd,"%c%c%c",255,0,0);
-
-					cityorcounty=1;
-				}
-
-				else if (mask&4)
-				{
-					/* County Boundaries: Black */
-
-					fprintf(fd,"%c%c%c",0,0,0);
-
-					cityorcounty=1;
-				}
-
-				if (cityorcounty==0)
-				{
-					if (contour_threshold!=0 && dBm<contour_threshold)
-					{
-						if (ngs) /* No terrain */
-							fprintf(fd,"%c%c%c",255,255,255);
-						else
-						{
-							/* Display land or sea elevation */
-
-							if (dem[indx].data[x0][y0]==0)
-								fprintf(fd,"%c%c%c",0,0,170);
-							else
-							{
-								terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-								fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-							}
-						}
-					}
-
-					else
-					{
-						/* Plot signal power level regions in color */
-
-						if (red!=0 || green!=0 || blue!=0)
-							fprintf(fd,"%c%c%c",red,green,blue);
-
-						else  /* terrain / sea-level */
-						{
-							if (ngs)
-								fprintf(fd,"%c%c%c",255,255,255);
-							else
-							{
-								if (dem[indx].data[x0][y0]==0)
-									fprintf(fd,"%c%c%c",0,0,170);
-								else
-								{
-									/* Elevation: Greyscale */
-									terrain=(unsigned)(0.5+pow((double)(dem[indx].data[x0][y0]-min_elevation),one_over_gamma)*conversion);
-									fprintf(fd,"%c%c%c",terrain,terrain,terrain);
-								}
-							}
-						}
-					}
-				}
-			}
-
+				c = dbm_pixel_color(indx, x0, y0, ngs,
+				                    min_elevation, one_over_gamma, conversion);
 			else
-			{
-				/* We should never get here, but if */
-				/* we do, display the region as black */
+				c = render::Color{0, 0, 0};
 
-				fprintf(fd,"%c%c%c",0,0,0);
-			}
+			if (png_output)
+				img->set((unsigned)x, (unsigned)y, c);
+			else
+				fprintf(fd, "%c%c%c", c.r, c.g, c.b);
 		}
 	}
 
-	if (kml==0 && geo==0)
+	/* Bottom legend bar (skipped in georeferenced modes). */
+	if (legend_h > 0)
 	{
-		/* Display legend along bottom of image
-		   if not generating .kml or .geo output. */
-
-		colorwidth=(int)rint((float)width/(float)region.levels);
-
-		for (y0=0; y0<30; y0++)
+		colorwidth = (int)rint((float)width / (float)region.levels);
+		for (y0=0; y0<(int)legend_h; y0++)
 		{
 			for (x0=0; x0<(int)width; x0++)
 			{
-				indx=x0/colorwidth;
-				x=x0%colorwidth;
-
-				level=abs(region.level[indx]);
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-		       		if (y0>=8 && y0<=23)
-				{
-					if (hundreds>0)
-					{
-						if (region.level[indx]<0)
-						{
-							if (x>=5 && x<=12)
-								if (fontdata[16*('-')+(y0-8)]&(128>>(x-5)))
-									indx=255;
-						}
-
-						else
-						{	
-							if (x>=5 && x<=12)
-								if (fontdata[16*('+')+(y0-8)]&(128>>(x-5)))
-									indx=255;
-						}
-
-				  		if (x>=13 && x<=20)     
-				      			if (fontdata[16*(hundreds+'0')+(y0-8)]&(128>>(x-13)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (hundreds==0)
-						{
-							if (region.level[indx]<0)
-							{
-								if (x>=13 && x<=20)
-									if (fontdata[16*('-')+(y0-8)]&(128>>(x-13)))
-										indx=255;
-							}
-
-							else
-							{
-								if (x>=13 && x<=20)
-									if (fontdata[16*('+')+(y0-8)]&(128>>(x-13)))
-										indx=255;
-							}
-						}
-						
-						if (x>=21 && x<=28)     
-							if (fontdata[16*(tens+'0')+(y0-8)]&(128>>(x-21)))
-								indx=255;
-					}
-
-					if (hundreds==0 && tens==0)
-					{
-						if (region.level[indx]<0)
-						{
-							if (x>=21 && x<=28)
-								if (fontdata[16*('-')+(y0-8)]&(128>>(x-21)))
-									indx=255;
-						}
-
-						else
-						{
-							if (x>=21 && x<=28)
-								if (fontdata[16*('+')+(y0-8)]&(128>>(x-21)))
-									indx=255;
-						}
-					}
-
-					if (x>=29 && x<=36)
-						if (fontdata[16*(units+'0')+(y0-8)]&(128>>(x-29)))
-							indx=255;
-
-					if (x>=37 && x<=44)
-						if (fontdata[16*('d')+(y0-8)]&(128>>(x-37)))
-							indx=255;
-
-					if (x>=45 && x<=52)
-						if (fontdata[16*('B')+(y0-8)]&(128>>(x-45)))
-							indx=255;
-
-					if (x>=53 && x<=60)
-						if (fontdata[16*('m')+(y0-8)]&(128>>(x-53)))
-							indx=255;
-		       		}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
+				render::Color c = dbm_legend_pixel(x0, y0, colorwidth);
+				if (png_output)
+					img->set((unsigned)x0, height + (unsigned)y0, c);
 				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
 		}
 	}
 
-	fclose(fd);
-
+	if (png_output)
+	{
+		if (!render::write_png(*img, mapfile))
+			fprintf(stderr, "\n*** ERROR: Failed to write PNG \"%s\"\n", mapfile);
+		delete img;
+	}
+	else
+	{
+		fclose(fd);
+	}
 
 	if (kml)
 	{
-		/* Write colorkey image file */
+		/* Color-key sidecar image (writes ckfile). */
+		const unsigned ck_w = 100u;
+		const unsigned ck_h = (unsigned)(30 * region.levels);
 
-		fd=fopen(ckfile,"wb");
-
-		height=30*region.levels;
-		width=100;
-
-		fprintf(fd,"P6\n%u %u\n255\n",width,height);
-
-		for (y0=0; y0<(int)height; y0++)
+		render::Image *ck_img = NULL;
+		fd = NULL;
+		if (png_output)
 		{
-			for (x0=0; x0<(int)width; x0++)
-			{
-				indx=y0/30;
-				x=x0;
-
-				level=abs(region.level[indx]);
-
-				hundreds=level/100;
-
-				if (hundreds>0)
-					level-=(hundreds*100);
-
-				tens=level/10;
-
-				if (tens>0)
-					level-=(tens*10);
-
-				units=level;
-
-
-				if ((y0%30)>=8 && (y0%30)<=23)
-				{
-					if (hundreds>0)
-					{
-						if (region.level[indx]<0)
-						{
-							if (x>=5 && x<=12)
-								if (fontdata[16*('-')+((y0%30)-8)]&(128>>(x-5)))
-									indx=255;
-						}
-
-						else
-						{	
-							if (x>=5 && x<=12)
-								if (fontdata[16*('+')+((y0%30)-8)]&(128>>(x-5)))
-									indx=255;
-						}
-
-				  		if (x>=13 && x<=20)     
-				      			if (fontdata[16*(hundreds+'0')+((y0%30)-8)]&(128>>(x-13)))
-								indx=255; 
-			    		}
-
-					if (tens>0 || hundreds>0)
-					{
-						if (hundreds==0)
-						{
-							if (region.level[indx]<0)
-							{
-								if (x>=13 && x<=20)
-									if (fontdata[16*('-')+((y0%30)-8)]&(128>>(x-13)))
-										indx=255;
-							}
-
-							else
-							{
-								if (x>=13 && x<=20)
-									if (fontdata[16*('+')+((y0%30)-8)]&(128>>(x-13)))
-										indx=255;
-							}
-						}
-						
-						if (x>=21 && x<=28)     
-							if (fontdata[16*(tens+'0')+((y0%30)-8)]&(128>>(x-21)))
-								indx=255;
-					}
-
-					if (hundreds==0 && tens==0)
-					{
-						if (region.level[indx]<0)
-						{
-							if (x>=21 && x<=28)
-								if (fontdata[16*('-')+((y0%30)-8)]&(128>>(x-21)))
-									indx=255;
-						}
-
-						else
-						{
-							if (x>=21 && x<=28)
-								if (fontdata[16*('+')+((y0%30)-8)]&(128>>(x-21)))
-									indx=255;
-						}
-					}
-
-					if (x>=29 && x<=36)
-						if (fontdata[16*(units+'0')+((y0%30)-8)]&(128>>(x-29)))
-							indx=255;
-
-					if (x>=37 && x<=44)
-						if (fontdata[16*('d')+((y0%30)-8)]&(128>>(x-37)))
-							indx=255;
-
-					if (x>=45 && x<=52)
-						if (fontdata[16*('B')+((y0%30)-8)]&(128>>(x-45)))
-							indx=255;
-
-					if (x>=53 && x<=60)
-						if (fontdata[16*('m')+((y0%30)-8)]&(128>>(x-53)))
-							indx=255;
-				}
-
-				if (indx>region.levels)
-					fprintf(fd,"%c%c%c",0,0,0);
-
-				else
-				{
-					red=region.color[indx][0];
-					green=region.color[indx][1];
-					blue=region.color[indx][2];
-
-					fprintf(fd,"%c%c%c",red,green,blue);
-				}
-			} 
+			ck_img = new render::Image(ck_w, ck_h);
+		}
+		else
+		{
+			fd = fopen(ckfile, "wb");
+			fprintf(fd, "P6\n%u %u\n255\n", ck_w, ck_h);
 		}
 
-		fclose(fd);
+		for (y0=0; y0<(int)ck_h; y0++)
+		{
+			for (x0=0; x0<(int)ck_w; x0++)
+			{
+				render::Color c = dbm_colorkey_pixel(x0, y0);
+				if (png_output)
+					ck_img->set((unsigned)x0, (unsigned)y0, c);
+				else
+					fprintf(fd, "%c%c%c", c.r, c.g, c.b);
+			}
+		}
+
+		if (png_output)
+		{
+			if (!render::write_png(*ck_img, ckfile))
+				fprintf(stderr, "\n*** ERROR: Failed to write color-key PNG \"%s\"\n", ckfile);
+			delete ck_img;
+		}
+		else
+		{
+			fclose(fd);
+		}
 	}
 
 	fprintf(stdout,"Done!\n");
