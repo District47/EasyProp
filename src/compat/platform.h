@@ -21,8 +21,16 @@
   #ifndef unlink
     #define unlink _unlink
   #endif
+  /* The legacy SDF tile naming convention uses ':' as the field separator
+     (e.g. "40:41:74:75.sdf"), but ':' is illegal in Windows filenames -- NTFS
+     parses "name:stream" as an alternate-data-stream reference. Substitute
+     '_' on Windows so terrain tiles can be created, named, and loaded
+     normally. Tiles generated on a Unix host (':' names) won't be usable
+     on Windows; regenerate them on the Windows side. */
+  #define SDF_SEP "_"
 #else
   #include <unistd.h>   /* unlink, getpid, mkstemp, ...                    */
+  #define SDF_SEP ":"
 #endif
 
 #ifdef __cplusplus

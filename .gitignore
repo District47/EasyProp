@@ -45,3 +45,6 @@ CMakeUserPresets.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- Claude Code harness state (per-machine, never tracked) ---
+.claude/

@@ -529,7 +529,16 @@ double Distance(struct site site1, struct site site2)
 	lat2=site2.lat*DEG2RAD;
 	lon2=site2.lon*DEG2RAD;
 
-	distance=3959.0*acos(sin(lat1)*sin(lat2)+cos(lat1)*cos(lat2)*cos((lon1)-(lon2)));
+	/* Clamp the spherical-law-of-cosines argument to [-1, 1].  For identical
+	   (or antipodal) sites the analytical value is exactly 1 (or -1), but
+	   floating-point roundoff -- especially under -ffast-math / /fp:fast --
+	   can produce 1.0+eps, making acos() return NaN and poisoning every
+	   downstream computation that uses this distance (e.g. ObstructionAnalysis,
+	   where the path's end-point hits exactly this case at site_x == rcvr). */
+	double arg=sin(lat1)*sin(lat2)+cos(lat1)*cos(lat2)*cos((lon1)-(lon2));
+	if (arg>1.0)  arg=1.0;
+	if (arg<-1.0) arg=-1.0;
+	distance=3959.0*acos(arg);
 
 	return distance;
 }
@@ -1684,7 +1693,7 @@ int LoadSDF_SDF(char *name)
 
 	/* Parse filename for minimum latitude and longitude values */
 
-	sscanf(sdf_file,"%d:%d:%d:%d",&minlat,&maxlat,&minlon,&maxlon);
+	sscanf(sdf_file,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d",&minlat,&maxlat,&minlon,&maxlon);
 
 	sdf_file[x]='.';
 	sdf_file[x+1]='s';
@@ -1913,7 +1922,7 @@ int LoadSDF_BZ(char *name)
 
 	/* Parse sdf_file name for minimum latitude and longitude values */
 
-	sscanf(sdf_file,"%d:%d:%d:%d",&minlat,&maxlat,&minlon,&maxlon);
+	sscanf(sdf_file,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d",&minlat,&maxlat,&minlon,&maxlon);
 
 	sdf_file[x]='.';
 	sdf_file[x+1]='s';
@@ -2094,7 +2103,7 @@ char LoadSDF(char *name)
 	{
 		/* Parse SDF name for minimum latitude and longitude values */
 
-		sscanf(name,"%d:%d:%d:%d",&minlat,&maxlat,&minlon,&maxlon);
+		sscanf(name,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d",&minlat,&maxlat,&minlon,&maxlon);
 
 		/* Is it already in memory? */
 
@@ -7431,9 +7440,9 @@ void LoadTopoData(int max_lon, int min_lon, int max_lat, int min_lat)
 					ymax-=360;
 
 				if (ippd==3600)
-					snprintf(string,19,"%d:%d:%d:%d-hd",x, x+1, ymin, ymax);
+					snprintf(string,19,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d-hd",x, x+1, ymin, ymax);
 				else
-					snprintf(string,16,"%d:%d:%d:%d",x, x+1, ymin, ymax);
+					snprintf(string,16,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d",x, x+1, ymin, ymax);
 				LoadSDF(string);
 			}
 	}
@@ -7460,9 +7469,9 @@ void LoadTopoData(int max_lon, int min_lon, int max_lat, int min_lat)
 					ymax-=360;
 
 				if (ippd==3600)
-					snprintf(string,19,"%d:%d:%d:%d-hd",x, x+1, ymin, ymax);
+					snprintf(string,19,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d-hd",x, x+1, ymin, ymax);
 				else
-					snprintf(string,16,"%d:%d:%d:%d",x, x+1, ymin, ymax);
+					snprintf(string,16,"%d" SDF_SEP "%d" SDF_SEP "%d" SDF_SEP "%d",x, x+1, ymin, ymax);
 				LoadSDF(string);
 			}
 	}
