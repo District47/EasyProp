@@ -1,115 +1,137 @@
-# SPLAT! web viewer
+# SPLAT! interactive web viewer
 
-A tiny browser viewer that overlays SPLAT!'s coverage maps on an
-OpenStreetMap basemap, geographically anchored using the `.geo` sidecar
-SPLAT! already emits.
+A browser front-end for SPLAT!: click the map to place a transmitter,
+pick a band / power / antenna, hit **Compute coverage**, and watch the
+real-terrain RF propagation appear on top of an OpenStreetMap basemap.
 
-![WNJU-DT coverage over real SRTM terrain](screenshots/wnju-real-terrain.png)
-
-*30-mile line-of-sight coverage from WNJU-DT (40.8°N, 74.25°W) over real
-1-arc-second SRTM elevation data. The coverage shape is irregular because
-the Watchung ridges to the west shadow the signal; the river valleys carry
-it further than the surrounding hills do.*
+![Interactive viewer with the WNJU-DT reference overlay](screenshots/interactive-form.png)
 
 ## What you get
 
-- **OSM basemap** under your coverage data, so you can see exactly where
-  the signal goes versus the actual coastline / roads / cities.
-- An **opacity slider** to fade between the coverage overlay and the map.
-- A **"Fit to coverage" button** that snaps the viewport to the analysis
-  region.
-- The parsed bounds (north/south/east/west) shown in the side panel as a
-  sanity check.
+- **Click-to-place TX** — a single click drops a draggable pin; lat/lon
+  fill in automatically. Re-drag the pin to re-place.
+- **Band presets** — FRS, GMRS, MURS, 2 m / 70 cm amateur, UHF TV, custom.
+  Picking one auto-fills frequency and a typical power.
+- **Antenna presets** — rubber duck, 1/4-wave whip, standard fiberglass,
+  high-gain fiberglass, extended-range fiberglass, custom. Picking one
+  auto-fills the gain in dBi.
+- **All params editable** — frequency, power, gain, AGL height, range.
+  ERP is computed from `power × 10^((dBi − 2.15)/10)` and fed to SPLAT!'s
+  ITWOM propagation model.
+- **Compute coverage** — POST → server writes a `live.qth` + `live.lrp`,
+  invokes `splat-hd`, returns the result; the overlay refreshes in place.
+- **Overlay opacity slider** to fade between the coverage and the map.
 
-## Quick start
+The hero shot above shows the WNJU-DT reference overlay (a 1 MW UHF TV
+broadcast station, terrain-shadowed by the Watchung ridges) loaded as
+the initial preview; click anywhere on the map to start interactively
+computing your own coverage.
+
+## Quick start (interactive)
 
 ```powershell
-# 1. Generate a coverage PNG + the .geo sidecar (the -geo flag is what
-#    produces the sidecar; the .png extension picks the new PNG writer).
-splat -t wnju-dt.qth -c 30 -metric -geo -o coverage.png
+# One-time: fetch SRTM tiles for wherever you want to click TXs and build
+# the HD splat (see "One-time setup" below).
 
-# 2. Launch the viewer (opens http://localhost:8765/?name=coverage and
-#    your default browser).
-../viewer/launch.ps1 coverage
+cd C:\splat-work       # or wherever your SDF tiles + sample qth/lrp live
+..\viewer\launch.ps1 wnju-real                # or pass any other -BaseName
 ```
 
-That's it. Ctrl+C in the launch.ps1 window stops the server and cleans
-up its temp dir.
+Then in the browser:
+1. Click **📍 Click map to set TX**, then click somewhere on the map.
+2. Pick a band (GMRS auto-fills 462.6 MHz / 5 W). Pick an antenna
+   (high-gain fiberglass auto-fills 6 dBi). Tweak height/range.
+3. Click **Compute coverage**. After 10–60 s (SPLAT! is doing a real
+   ITWOM run over real SRTM elevation), the new coverage overlay
+   replaces the previous one in place.
 
-## End-to-end with real SRTM terrain
+Constraints:
+- You need SRTM SDF tiles covering wherever you click. The viewer doesn't
+  fetch on demand yet — see [utils/fetch_srtm.ps1](../utils/fetch_srtm.ps1)
+  to pre-stage a region.
+- Compute time scales with the analysis region. The HD build with
+  `MAXPAGES=4` covers up to 2°×2° (~7200×7200 px image); a 30-mile
+  coverage run inside that takes roughly 30–60 s on a modern desktop.
 
-The hero shot above was produced by this pipeline:
+## One-time setup
 
 ```powershell
-# 0. One-time: build srtm2sdf-hd (the HD SRTM converter).
+# Build srtm2sdf-hd (the HD SRTM converter).
 cmake -S . -B C:\splat-build -G "Visual Studio 17 2022" -A x64 -DSPLAT_BUILD_UTILS=ON
 cmake --build C:\splat-build --config Release --target srtm2sdf-hd
 
-# 0. One-time: build an HD splat (-DSPLAT_HD_MODE=1, in a separate build dir
-#    so the std-res splat + its baselines stay intact).
+# Build an HD splat (-DSPLAT_HD_MODE=1, in a separate build dir so the
+# std-res splat + its regression baselines stay intact).
 cmake -S . -B C:\splat-build-hd -G "Visual Studio 17 2022" -A x64 `
       -DSPLAT_HD_MODE=1 -DSPLAT_MAXPAGES=4
+cmake --build C:\splat-build-hd --config Release --target splat
 
-# 1. Fetch + convert the 4 SRTM tiles around WNJU-DT (40-41N x 73-74W
-#    SW-corner range -> covers 40-42N x 73-75W in 4 tiles, ~30 MB total).
+# Fetch + convert SRTM tiles for the region you care about (free, no
+# auth, ~1.8 MB per 1-arc-second tile from ESA SRTMGL1).
 mkdir C:\splat-work; cd C:\splat-work
-copy ..\sample_data\wnju-dt.qth .
+copy ..\sample_data\wnju-dt.qth .         # sample TX for the initial preview
 copy ..\sample_data\wnju-dt.lrp .
 ..\utils\fetch_srtm.ps1 -MinLat 40 -MaxLat 41 -MinWest 74 -MaxWest 75
 
-# 2. Run an HD coverage analysis (1-arc-second resolution -> 7200x7200 image).
+# Pre-render the WNJU reference overlay (optional — gives the viewer a
+# nice initial map before you start clicking).
 C:\splat-build-hd\Release\splat-hd.exe `
     -t wnju-dt.qth -c 30 -metric -geo -o wnju-real.png
-
-# 3. View it.
-..\viewer\launch.ps1 wnju-real
 ```
 
-`fetch_srtm.ps1` pulls from ESA's public SRTMGL1 mirror (no auth, ~1.8 MB
-per 1-arc-second tile), unzips, and runs `srtm2sdf-hd` on each `.hgt` to
-produce the `<lat>_<lat+1>_<west>_<west+1>-hd.sdf` files SPLAT! HD reads.
-Ocean tiles 404 from ESA and are skipped automatically.
+## HTTP API (for scripting)
 
-## How it works (no magic)
+The server has one endpoint beyond static GETs:
 
-`launch.ps1` stages `<name>.png`, `<name>.geo`, and `viewer/index.html`
-into a temp directory, then starts a tiny .NET `HttpListener` on
-`http://localhost:<port>/` (default 8765). No admin needed -- localhost
-binding doesn't require URL ACL reservations.
+```
+POST /compute
+Content-Type: application/json
 
-`index.html` is a single-page Leaflet app that:
-1. Loads Leaflet from unpkg CDN.
-2. Adds the OpenStreetMap tile layer as a basemap.
-3. `fetch()`es `<name>.geo` and parses its two `TIEPOINT` lines for the
-   bounding-box corners.
-4. Adds the PNG as an `L.imageOverlay` over those bounds.
-5. Fits the viewport, wires the opacity slider, done.
+{
+  "lat":              40.7,           // decimal degrees, + = N
+  "lon":              -74.05,         // decimal degrees, + = E (standard)
+  "freq_mhz":         462.6,
+  "watts":            5.0,            // raw TX power
+  "gain_dbi":         6.0,            // antenna gain over isotropic
+  "antenna_height_m": 10.0,           // AGL
+  "range_mi":         15,             // analysis radius (-c)
+  "polarization":     "V"             // "V" or "H"
+}
+```
 
-The same file works for any SPLAT! map -- `?name=foo` loads `foo.png`
-and `foo.geo`.
+Response:
+
+```json
+{ "ok": true, "elapsed_sec": 58.49, "png": "live.png", "geo": "live.geo" }
+```
+
+(or `{ "ok": false, "error": "..." }`)
+
+ERP is computed server-side as `watts × 10^((dBi − 2.15) / 10)` (relative
+to half-wave dipole, which is what SPLAT!'s `.lrp` file expects). The
+`.qth` is written in DMS with the legacy west-positive lon convention.
+After a successful response the browser re-fetches `/live.png` and
+`/live.geo` with a cache-buster.
 
 ## Options
 
 ```powershell
-launch.ps1 coverage                   # default: -SourceDir . -Port 8765
-launch.ps1 coverage -Port 9000        # different port
-launch.ps1 coverage -SourceDir ..\work
-launch.ps1 coverage -NoBrowser        # don't auto-open browser
+launch.ps1 wnju-real                                # most common
+launch.ps1 -SourceDir C:\splat-work -SdfDir C:\splat-work
+launch.ps1 -SplatHdExe D:\custom\splat-hd.exe
+launch.ps1 wnju-real -Port 9000
+launch.ps1 wnju-real -NoBrowser                     # for headless / CI
 ```
 
 ## Notes
 
-- The CDN load requires internet on first launch. If you need offline,
-  download `leaflet.css` and `leaflet.js` from unpkg.com/leaflet@1.9.4
+- The CDN load (Leaflet) requires internet on first launch. For offline,
+  vendor `leaflet.css` + `leaflet.js` from unpkg.com/leaflet@1.9.4
   alongside `index.html` and adjust the `<link>`/`<script>` URLs.
-- Leaflet's `imageOverlay` reprojects on-the-fly between the source
-  WGS-84 coordinates and the basemap's Web Mercator projection -- the
-  alignment is correct but the overlay stretches slightly toward the
-  poles, matching every other lat/lon raster in a slippy map.
-- For a more polished UX you can swap the OSM tile layer for any other
-  basemap (Mapbox, Esri World Imagery, Carto Voyager, ...). One line.
-- This viewer reads the `.geo` sidecar, not the GeoTIFF. Loading
-  GeoTIFF directly in the browser is possible via
-  [`leaflet-geotiff-2`](https://github.com/danwild/leaflet-geotiff)
-  or [`georaster-layer-for-leaflet`](https://github.com/GeoTIFF/georaster-layer-for-leaflet)
-  if you'd rather skip the sidecar.
+- Leaflet's `imageOverlay` reprojects the WGS-84 PNG on the fly to the
+  basemap's Web Mercator projection — alignment is correct but the
+  overlay stretches slightly toward the poles, matching every other
+  lat/lon raster in a slippy map.
+- You can swap the OSM tile layer for any other basemap (Mapbox, Esri
+  World Imagery, Carto Voyager) by changing the `L.tileLayer` URL —
+  one line.

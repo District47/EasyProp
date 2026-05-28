@@ -2,29 +2,57 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SPLAT! Coverage Viewer</title>
+<title>SPLAT! Live Coverage</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin="">
 <style>
-  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+  html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   #map { height: 100%; }
+
   .splat-panel {
-    background: rgba(255,255,255,0.95);
-    padding: 10px 14px;
+    background: rgba(255,255,255,0.97);
+    padding: 12px 14px;
     border-radius: 6px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-    font-size: 13px;
-    min-width: 220px;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.3);
+    font-size: 12px;
+    width: 260px;
+    max-height: calc(100vh - 30px);
+    overflow-y: auto;
   }
-  .splat-panel h3 { margin: 0 0 6px 0; font-size: 14px; }
-  .splat-panel .meta { color: #666; font-size: 11px; margin-bottom: 8px; }
-  .splat-panel label { display: block; margin-top: 6px; }
-  .splat-panel input[type=range] { width: 100%; }
-  .splat-panel .bounds { font-family: ui-monospace, Consolas, monospace;
-                         font-size: 11px; color: #555; margin-top: 6px;
-                         line-height: 1.4; }
-  .splat-panel .err { color: #c00; }
+  .splat-panel h3 { margin: 0 0 8px 0; font-size: 14px; }
+  .splat-panel h4 {
+    margin: 14px 0 4px 0; font-size: 10px; text-transform: uppercase;
+    color: #888; letter-spacing: 0.7px; border-bottom: 1px solid #eee; padding-bottom: 3px;
+  }
+  .splat-panel label { display: block; margin-top: 5px; font-size: 11px; color: #444; }
+  .splat-panel input, .splat-panel select {
+    width: 100%; box-sizing: border-box; padding: 4px 6px;
+    font-size: 12px; font-family: ui-monospace, Consolas, monospace;
+    margin-top: 2px;
+  }
+  .splat-panel button {
+    width: 100%; padding: 7px; margin-top: 8px; font-size: 12px;
+    cursor: pointer; border: 1px solid #888; background: white; border-radius: 3px;
+  }
+  .splat-panel button.primary { background: #2c7; color: white; border-color: #2c7; font-weight: 600; }
+  .splat-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .splat-panel button.active { background: #fc6; border-color: #c80; }
+  .splat-panel .status {
+    padding: 6px 8px; margin-top: 8px; font-size: 11px;
+    background: #f3f3f3; border-radius: 3px; min-height: 14px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .splat-panel .status.busy { background: #ffc; }
+  .splat-panel .status.ok   { background: #dfd; }
+  .splat-panel .status.err  { background: #fdd; color: #a00; }
+  .splat-panel .row { display: flex; gap: 6px; }
+  .splat-panel .row > label { flex: 1; }
+
+  .splat-tx-marker {
+    background: #c00; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);
+  }
 </style>
 </head>
 <body>
@@ -35,84 +63,230 @@
         crossorigin=""></script>
 <script>
 (async () => {
-  // ?name=foo  -> loads ./foo.png + ./foo.geo (defaults to "coverage")
-  const params = new URLSearchParams(location.search);
-  const name = params.get('name') || 'coverage';
+  const params  = new URLSearchParams(location.search);
+  const initialName = params.get('name') || 'live';
 
-  // Base map.
-  const map = L.map('map').setView([40.5, -74.5], 9);  // tentative; fitted later
+  // ---------------- Map + basemap ----------------
+  const map = L.map('map').setView([40.7, -74.0], 9);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap'
+    maxZoom: 19, attribution: '© OpenStreetMap'
   }).addTo(map);
 
-  // Side panel.
+  let txMarker = null;
+  let overlay  = null;
+  let placeMode = false;
+  let txLat = null, txLon = null;
+
+  // ---------------- Presets ----------------
+  // Antenna presets: typical gain in dBi (relative to isotropic).
+  const antennas = {
+    'rubber-duck':      { label: 'Stock rubber duck (handheld)',  gain: -2  },
+    'whip':             { label: '1/4-wave whip',                  gain:  2  },
+    'fiberglass-std':   { label: 'Standard fiberglass (5/8 wave)', gain:  3  },
+    'fiberglass-high':  { label: 'High-gain fiberglass omni',      gain:  6  },
+    'fiberglass-xhigh': { label: 'Extended-range fiberglass omni', gain:  9  },
+    'custom':           { label: 'Custom',                          gain: null }
+  };
+
+  // Band presets: default frequency MHz, typical max power W, polarization.
+  const bands = {
+    'frs':    { label: 'FRS (UHF 462 MHz)',       freq: 462.6,  watts:    2, pol: 'V' },
+    'gmrs':   { label: 'GMRS (UHF 462/467 MHz)',  freq: 462.6,  watts:    5, pol: 'V' },
+    'murs':   { label: 'MURS (VHF 151 MHz)',      freq: 151.82, watts:    2, pol: 'V' },
+    '2m-ham': { label: '2 m amateur (VHF 146)',   freq: 146.5,  watts:   50, pol: 'V' },
+    '70cm-ham':{ label: '70 cm amateur (UHF 432)',freq: 446.0,  watts:   50, pol: 'V' },
+    'tv-uhf': { label: 'UHF TV broadcast',         freq: 605,    watts: 1000, pol: 'H' },
+    'custom': { label: 'Custom',                    freq: null,   watts: null, pol: 'V' }
+  };
+
+  // ---------------- Side panel ----------------
   const panel = L.control({ position: 'topright' });
   panel.onAdd = () => {
     const div = L.DomUtil.create('div', 'splat-panel');
+    const antOpts  = Object.entries(antennas).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('');
+    const bandOpts = Object.entries(bands   ).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('');
     div.innerHTML = `
-      <h3>SPLAT! Coverage</h3>
-      <div class="meta">${name}.png · georeferenced overlay</div>
-      <label>Overlay opacity
-        <input id="op" type="range" min="0" max="1" step="0.05" value="0.6">
-      </label>
-      <button id="fit" style="margin-top:8px;width:100%;padding:6px;">
-        Fit to coverage
-      </button>
-      <div id="bounds" class="bounds"></div>
+      <h3>📡 SPLAT! Live Coverage</h3>
+
+      <h4>Transmitter</h4>
+      <button id="place">📍 Click map to set TX</button>
+      <div class="row">
+        <label>Lat <input id="lat" type="number" step="0.0001" placeholder="40.8022"></label>
+        <label>Lon <input id="lon" type="number" step="0.0001" placeholder="-74.2464"></label>
+      </div>
+
+      <h4>Radio</h4>
+      <label>Band <select id="band">${bandOpts}</select></label>
+      <label>Frequency (MHz) <input id="freq" type="number" step="0.1"></label>
+      <label>Power (W) <input id="watts" type="number" step="0.1"></label>
+
+      <h4>Antenna</h4>
+      <label>Type <select id="ant">${antOpts}</select></label>
+      <div class="row">
+        <label>Gain (dBi) <input id="gain" type="number" step="0.1"></label>
+        <label>Height AGL (m) <input id="height" type="number" step="0.5" value="10"></label>
+      </div>
+
+      <h4>Analysis</h4>
+      <label>Range (mi) <input id="range" type="number" step="1" value="30"></label>
+
+      <button id="compute" class="primary" disabled>Compute coverage</button>
+      <div id="status" class="status">Place a transmitter to begin.</div>
+
+      <h4>Overlay</h4>
+      <label>Opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.6"></label>
     `;
     L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
     return div;
   };
   panel.addTo(map);
 
-  // Read the .geo sidecar (Xastir format). 2 TIEPOINT lines give us
-  // (image-pixel-x, image-pixel-y, lon, lat) for opposite corners.
-  let txt;
-  try {
-    const r = await fetch(`${name}.geo`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    txt = await r.text();
-  } catch (e) {
-    document.getElementById('bounds').innerHTML =
-      `<span class="err">Could not load ${name}.geo: ${e.message}</span>`;
-    return;
+  // ---------------- DOM refs ----------------
+  const $       = id => document.getElementById(id);
+  const placeBtn= $('place');
+  const latInp  = $('lat');
+  const lonInp  = $('lon');
+  const bandSel = $('band');
+  const freqInp = $('freq');
+  const wattsInp= $('watts');
+  const antSel  = $('ant');
+  const gainInp = $('gain');
+  const heightInp = $('height');
+  const rangeInp= $('range');
+  const compBtn = $('compute');
+  const statusEl= $('status');
+  const opSlider= $('op');
+
+  // Initialise presets
+  bandSel.value = 'gmrs';
+  antSel.value  = 'fiberglass-high';
+  freqInp.value = bands.gmrs.freq;
+  wattsInp.value= bands.gmrs.watts;
+  gainInp.value = antennas['fiberglass-high'].gain;
+
+  bandSel.addEventListener('change', () => {
+    const p = bands[bandSel.value];
+    if (p.freq  !== null) freqInp.value  = p.freq;
+    if (p.watts !== null) wattsInp.value = p.watts;
+  });
+  antSel.addEventListener('change', () => {
+    const p = antennas[antSel.value];
+    if (p.gain !== null) gainInp.value = p.gain;
+  });
+
+  function setStatus(msg, cls='') {
+    statusEl.textContent = msg;
+    statusEl.className   = 'status ' + cls;
   }
 
-  const tiepoints = txt.split('\n')
-    .filter(l => l.startsWith('TIEPOINT'))
-    .map(l => {
+  // ---------------- TX placement ----------------
+  function setTx(lat, lon) {
+    txLat = lat; txLon = lon;
+    latInp.value = lat.toFixed(4);
+    lonInp.value = lon.toFixed(4);
+    if (txMarker) { txMarker.setLatLng([lat, lon]); }
+    else {
+      const icon = L.divIcon({className: 'splat-tx-marker', iconSize: [14, 14]});
+      txMarker = L.marker([lat, lon], {icon: icon, draggable: true}).addTo(map);
+      txMarker.on('dragend', e => {
+        const ll = e.target.getLatLng();
+        setTx(ll.lat, ll.lng);
+      });
+    }
+    compBtn.disabled = false;
+    if (statusEl.textContent.startsWith('Place')) {
+      setStatus(`TX at (${lat.toFixed(4)}, ${lon.toFixed(4)}). Click "Compute coverage".`);
+    }
+  }
+  function setPlaceMode(on) {
+    placeMode = on;
+    placeBtn.classList.toggle('active', on);
+    placeBtn.textContent = on ? '✕ Cancel placement' : '📍 Click map to set TX';
+    map.getContainer().style.cursor = on ? 'crosshair' : '';
+  }
+  placeBtn.addEventListener('click', () => setPlaceMode(!placeMode));
+  map.on('click', e => {
+    if (placeMode) {
+      setTx(e.latlng.lat, e.latlng.lng);
+      setPlaceMode(false);
+    }
+  });
+  function maybeUpdateFromInputs() {
+    if (latInp.value !== '' && lonInp.value !== '') {
+      setTx(+latInp.value, +lonInp.value);
+    }
+  }
+  latInp.addEventListener('change', maybeUpdateFromInputs);
+  lonInp.addEventListener('change', maybeUpdateFromInputs);
+
+  // ---------------- Compute ----------------
+  async function loadOverlay(pngUrl, geoUrl) {
+    const txt = await (await fetch(geoUrl)).text();
+    const tps = txt.split('\n').filter(l => l.startsWith('TIEPOINT')).map(l => {
       const f = l.split(/\s+/);
-      return { x:+f[1], y:+f[2], lon:+f[3], lat:+f[4] };
+      return { lon: +f[3], lat: +f[4] };
     });
-  if (tiepoints.length < 2) {
-    document.getElementById('bounds').textContent =
-      'Bad .geo file (no TIEPOINT lines)';
-    return;
+    if (tps.length < 2) throw new Error('bad .geo (no TIEPOINT lines)');
+    const lats = tps.map(p => p.lat), lons = tps.map(p => p.lon);
+    const bounds = [
+      [Math.min(...lats), Math.min(...lons)],
+      [Math.max(...lats), Math.max(...lons)]
+    ];
+    if (overlay) map.removeLayer(overlay);
+    overlay = L.imageOverlay(pngUrl, bounds, {
+      opacity: +opSlider.value, interactive: false
+    }).addTo(map);
+    return bounds;
   }
 
-  const lats = tiepoints.map(p => p.lat);
-  const lons = tiepoints.map(p => p.lon);
-  const south = Math.min(...lats), north = Math.max(...lats);
-  const west  = Math.min(...lons), east  = Math.max(...lons);
-  const bounds = [[south, west], [north, east]];
-
-  document.getElementById('bounds').innerHTML =
-    `north ${north.toFixed(4)}<br>south ${south.toFixed(4)}<br>` +
-    `west  ${west.toFixed(4)}<br>east  ${east.toFixed(4)}`;
-
-  const overlay = L.imageOverlay(`${name}.png`, bounds, {
-    opacity: 0.6,
-    interactive: false
-  }).addTo(map);
-  map.fitBounds(bounds);
-
-  document.getElementById('op').addEventListener('input', e => {
-    overlay.setOpacity(parseFloat(e.target.value));
+  compBtn.addEventListener('click', async () => {
+    if (txLat === null) return;
+    const req = {
+      lat: txLat,
+      lon: txLon,
+      freq_mhz: +freqInp.value,
+      watts: +wattsInp.value,
+      gain_dbi: +gainInp.value,
+      antenna_height_m: +heightInp.value,
+      range_mi: +rangeInp.value,
+      polarization: bands[bandSel.value]?.pol || 'V'
+    };
+    compBtn.disabled = true;
+    const t0 = performance.now();
+    setStatus('Computing coverage… (5–20 s)', 'busy');
+    try {
+      const r = await fetch('/compute', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(req)
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'unknown error');
+      const t = Date.now();
+      const bounds = await loadOverlay(`live.png?t=${t}`, `live.geo?t=${t}`);
+      map.fitBounds(bounds);
+      const dt = ((performance.now() - t0) / 1000).toFixed(1);
+      setStatus(`Done in ${dt}s · splat ${data.elapsed_sec.toFixed(1)}s`, 'ok');
+    } catch (e) {
+      setStatus('FAIL: ' + e.message, 'err');
+    } finally {
+      compBtn.disabled = false;
+    }
   });
-  document.getElementById('fit').addEventListener('click', () => {
-    map.fitBounds(bounds);
+
+  opSlider.addEventListener('input', e => {
+    if (overlay) overlay.setOpacity(parseFloat(e.target.value));
   });
+
+  // ---------------- Initial overlay (if a pre-existing file is named) ----------------
+  try {
+    const r = await fetch(`${initialName}.geo`);
+    if (r.ok) {
+      const bounds = await loadOverlay(`${initialName}.png`, `${initialName}.geo`);
+      map.fitBounds(bounds);
+    }
+  } catch { /* no initial overlay; that's fine */ }
 })();
 </script>
 </body>
