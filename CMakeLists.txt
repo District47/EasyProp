@@ -56,38 +56,50 @@ include(cmake/Dependencies.cmake)
 find_package(OpenMP REQUIRED)
 
 # ---------------------------------------------------------------------------
-# splat executable
+# splat executables -- both HD and standard (draft) variants from one source
+#
+# Phase 14: we always build BOTH splat-hd (HD_MODE=1, 1-arc-second / IPPD=3600,
+# slower + more detailed) AND splat-std (HD_MODE=0, 3-arc-second / IPPD=1200,
+# ~9x faster + chunkier). The viewer picks one per request based on a Draft
+# checkbox. Earlier the choice was a configure-time CMake variable producing
+# only one binary -- that meant flipping draft on/off needed a full reconfigure.
 # ---------------------------------------------------------------------------
-add_executable(splat
+
+set(_splat_sources
   src/splat.cpp
   src/itwom3.0.cpp
   src/compat/platform.cpp
   src/render/PngWriter.cpp
   src/render/GeoTiffWriter.cpp)
 
-target_include_directories(splat PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}"   # generated splat_config.h
-  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+function(_add_splat_variant target_name hd_mode output_name)
+  add_executable(${target_name} ${_splat_sources})
+  target_include_directories(${target_name} PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}"             # generated splat_config.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(${target_name} PRIVATE
+    BZip2::BZip2 TIFF::TIFF OpenMP::OpenMP_CXX)
+  # The HD_MODE define is the ONLY difference between the two binaries; both
+  # see the same splat_config.h whose own HD_MODE define is wrapped in an
+  # #ifndef so this -D wins.
+  target_compile_definitions(${target_name} PRIVATE HD_MODE=${hd_mode})
+  set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "${output_name}")
+  if(MSVC)
+    target_compile_definitions(${target_name} PRIVATE
+      _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+    target_compile_options(${target_name} PRIVATE /fp:fast $<$<CONFIG:Release>:/O2>)
+    # SPLAT!'s deep ITWOM call chain uses far more stack than MSVC's 1 MB
+    # default allows (Linux defaults to 8 MB, which is why upstream never hit
+    # this). Reserve 16 MB so the analysis routines don't overflow.
+    target_link_options(${target_name} PRIVATE /STACK:16777216)
+  else()
+    target_compile_options(${target_name} PRIVATE
+      -ffast-math $<$<CONFIG:Release>:-O2>)
+  endif()
+endfunction()
 
-target_link_libraries(splat PRIVATE BZip2::BZip2 TIFF::TIFF OpenMP::OpenMP_CXX)
-
-if(MSVC)
-  target_compile_definitions(splat PRIVATE
-    _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
-  target_compile_options(splat PRIVATE /fp:fast $<$<CONFIG:Release>:/O2>)
-  # SPLAT!'s deep ITWOM propagation call chain uses far more stack than MSVC's
-  # 1 MB default allows (Linux defaults to 8 MB, which is why upstream never
-  # hit this). Reserve 16 MB so the analysis routines don't overflow.
-  target_link_options(splat PRIVATE /STACK:16777216)
-else()
-  target_compile_options(splat PRIVATE
-    -ffast-math $<$<CONFIG:Release>:-O2>)
-endif()
-
-# Name the HD build "splat-hd" to mirror the original convention.
-if(SPLAT_HD_MODE STREQUAL "1")
-  set_target_properties(splat PROPERTIES OUTPUT_NAME "splat-hd")
-endif()
+_add_splat_variant(splat_hd  1 "splat-hd")
+_add_splat_variant(splat_std 0 "splat")
 
 if(SPLAT_BUILD_UTILS)
   add_subdirectory(utils)

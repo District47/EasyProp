@@ -161,6 +161,14 @@
 
       <h4>Analysis</h4>
       <label>Range (mi) <input id="range" type="number" step="1" value="30"></label>
+      <!-- Phase 14: Draft toggle. HD (1 arc-sec, default) runs at full
+           resolution; Draft (3 arc-sec) is ~17x faster but visibly chunkier
+           coverage edges. Requires the standard-resolution tile cache,
+           built once via utils/downsample_hd_to_std.ps1. -->
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#aaa;">
+        <input id="draft" type="checkbox">
+        Draft mode (faster, lower resolution)
+      </label>
 
       <button id="compute" class="primary" disabled>Compute coverage</button>
       <div id="status" class="status">Place a transmitter to begin.</div>
@@ -384,7 +392,11 @@
       gain_dbi: +gainInp.value,
       antenna_height_m: +heightInp.value,
       range_mi: +rangeInp.value,
-      polarization: bands[bandSel.value]?.pol || 'V'
+      polarization: bands[bandSel.value]?.pol || 'V',
+      // Phase 14: server uses this to pick splat (Draft) vs splat-hd, and
+      // the std vs HD SDF cache. Field name `draft` is what Get-CacheKey
+      // checks; absence is treated as false (HD).
+      draft: document.getElementById('draft').checked
     };
     compBtn.disabled = true;
     const t0 = performance.now();

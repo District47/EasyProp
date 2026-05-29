@@ -46,6 +46,10 @@ param(
     # fail with permission-denied writing tile downloads.
     [string]$SourceDir  = "$env:LOCALAPPDATA\EasyProp\work-hd",
     [string]$SdfDir     = "",
+    # Phase 14: standard-resolution (3 arc-sec) tile dir for Draft mode.
+    # Populate it by running utils\downsample_hd_to_std.ps1 over the HD dir
+    # -- one-time, ~5 min for a 140-tile NE precache, no re-download needed.
+    [string]$StdSdfDir  = "$env:LOCALAPPDATA\EasyProp\work-std",
     # Both binaries now ship out of one build tree at C:\splat-build (the older
     # C:\splat-build-hd path is kept as a fallback for users who haven't
     # reconfigured yet, but the unified tree is preferred so the Phase-12
@@ -55,6 +59,10 @@ param(
                           } else {
                               'C:\splat-build-hd\Release\splat-hd.exe'
                           }),
+    # Phase 14: standard (non-HD) splat. Same binary built with HD_MODE=0;
+    # the Draft toggle in the viewer picks this one. ~17x faster than HD at
+    # 1/3 the linear resolution.
+    [string]$SplatStdExe = 'C:\splat-build\Release\splat.exe',
     [string]$SrtmTool   = "C:\splat-build\utils\Release\srtm2sdf-hd.exe",
     # Cache dir for previously-computed (lat,lon,freq,power,gain,antenna_h,
     # range,pol) -> png+geo pairs. A cache hit serves the saved image in
@@ -466,7 +474,7 @@ function Parse-SplatProgress {
 # would invalidate previously-cached PNGs. Cached files from a different
 # schema simply won't be found by Get-CacheKey and the next run will
 # regenerate. Stale files are inert -- delete the cache dir to clean them up.
-$script:CACHE_SCHEMA = 'v2'   # v2: per-request tile-bbox tightening (Phase 13)
+$script:CACHE_SCHEMA = 'v3'   # v3: Draft toggle (Phase 14) -- key now includes res
 
 function Get-CacheKey {
     # Canonicalize the request into a stable JSON document, then SHA-256 it.
@@ -484,6 +492,8 @@ function Get-CacheKey {
         antenna_height_m = [math]::Round([double]$Req.antenna_height_m, 2)
         range_mi         = [math]::Round([double]$Req.range_mi,         2)
         polarization     = "$($Req.polarization)"
+        # Phase 14: HD vs Draft produces different images, must not share keys.
+        res              = if ($Req.draft) { 'std' } else { 'hd' }
     }
     $json = $canon | ConvertTo-Json -Compress
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -580,14 +590,39 @@ function Invoke-SplatComputeStreaming {
     }
     $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $effDeg
 
+    # Phase 14: Draft mode reads from the standard-resolution tile dir and
+    # the auto-fetcher is HD-only (srtm2sdf-hd converts to the -hd.sdf the
+    # fetch worker writes). For draft we skip the fetch entirely -- standard
+    # tiles must already exist (downsample_hd_to_std.ps1 over the HD cache).
+    # If draft is on but the STD tile is missing, splat-std sea-level-fills
+    # it (visibly: a smooth blue rectangle in that quadrant of the map), and
+    # the user knows to either run the downsampler or flip back to HD.
+    $isDraft     = [bool]$Req.draft
+    $effSdfDir   = if ($isDraft) { $StdSdfDir } else { $SdfDir }
+    $effSplatExe = if ($isDraft) { $SplatStdExe } else { $SplatHdExe }
+
     # -------- Fetch phase (parallel) --------------------------------------
     $fetchSw = [System.Diagnostics.Stopwatch]::StartNew()
-    try {
-        $fetchTally = Fetch-MissingTilesAsync -Tiles $required -OutDir $SdfDir `
-                          -SrtmToolPath $SrtmTool -EmitEvent $EmitEvent
-    } catch {
-        & $EmitEvent @{ stage='error'; error="SRTM fetch failed: $($_.Exception.Message)" }
-        return
+    if ($isDraft) {
+        # Skip auto-fetch in draft; the fetcher only produces -hd.sdf and we'd
+        # need to chain a downsample to make it useful here. Just report what
+        # we have on hand and let splat-std fill any missing tiles with sea
+        # level (clearly visible as a flat blue patch).
+        $present = ($required | Where-Object { Test-Path (Join-Path $effSdfDir (Get-SdfName -Lat $_.Lat -West $_.West)) }).Count
+        $missing = $required.Count - $present
+        & $EmitEvent @{
+            stage = 'fetch_done'; tiles_fetched=0; tiles_skipped=$missing; tiles_failed=0
+            note  = "draft mode: $present std tiles present, $missing missing (sea-level fill)"
+        }
+        $fetchTally = @{ ok=0; skipped=$missing; failed=0 }
+    } else {
+        try {
+            $fetchTally = Fetch-MissingTilesAsync -Tiles $required -OutDir $SdfDir `
+                              -SrtmToolPath $SrtmTool -EmitEvent $EmitEvent
+        } catch {
+            & $EmitEvent @{ stage='error'; error="SRTM fetch failed: $($_.Exception.Message)" }
+            return
+        }
     }
     $fetchSw.Stop()
 
@@ -627,7 +662,8 @@ function Invoke-SplatComputeStreaming {
     # pre-creating them with Set-Content actually causes Start-Process to fail
     # to open them for redirection on some systems.
 
-    & $EmitEvent @{ stage='splat_start'; message='Running ITWOM propagation' }
+    # (splat_start event is emitted below, after the HD/Draft binary pick,
+    # so the browser knows which mode it's running.)
     $splatSw = [System.Diagnostics.Stopwatch]::StartNew()
 
     # Phase 13: -bbox <eff_deg> tells splat-hd to use this half-width for
@@ -635,11 +671,16 @@ function Invoke-SplatComputeStreaming {
     # still set by -R; bbox is set independently by -bbox. Net effect: the
     # rendered image shrinks to ~(2*eff_deg)x(2*eff_deg) degrees and the
     # ray count drops proportionally.
-    $argList = @('-d', $SdfDir, '-t', "$name.qth",
+    $argList = @('-d', $effSdfDir, '-t', "$name.qth",
                  '-L', "$rxHeightM", '-R', "$rangeKm",
                  '-bbox', "$([math]::Round($effDeg, 4))",
                  '-dbm', '-metric', '-geo', '-o', "$name.png")
-    $proc = Start-Process -FilePath $SplatHdExe -ArgumentList $argList `
+    & $EmitEvent @{
+        stage = 'splat_start'
+        message = if ($isDraft) { 'Running ITWOM (Draft / 3-arc-sec)' } else { 'Running ITWOM (HD / 1-arc-sec)' }
+        mode  = if ($isDraft) { 'draft' } else { 'hd' }
+    }
+    $proc = Start-Process -FilePath $effSplatExe -ArgumentList $argList `
               -WorkingDirectory $serveDir -NoNewWindow -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 

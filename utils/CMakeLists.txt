@@ -31,6 +31,16 @@ if(MSVC)
   endforeach()
 endif()
 
+# --- sdf_hd_to_std (Phase 14): downsamples an HD .sdf to standard --------
+# Lets the precached HD tile library feed standard splat without
+# re-downloading any .hgt files.
+add_executable(sdf_hd_to_std sdf_hd_to_std.c)
+target_include_directories(sdf_hd_to_std PRIVATE "${CMAKE_SOURCE_DIR}/src")
+if(MSVC)
+  target_compile_definitions(sdf_hd_to_std PRIVATE
+    _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+
 # --- Not-yet-ported (POSIX-only) -------------------------------------------
 if(NOT MSVC)
   add_executable(citydecoder citydecoder.c)

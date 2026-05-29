@@ -14,10 +14,15 @@
 /* SPLAT! version string (was hard-coded in splat.cpp; centralized here). */
 #define SPLAT_VERSION_STRING "@PROJECT_VERSION@"
 
-/* Resolution mode:
+/* HD_MODE is set per-target via target_compile_definitions in CMake
+   (see CMakeLists.txt for the splat / splat-hd targets).  It is no
+   longer baked into this header so that one source tree can produce
+   both binaries from one CMake configure.
      0 = standard definition (3 arc-second data, IPPD 1200)
      1 = high definition     (1 arc-second data, IPPD 3600)            */
-#define HD_MODE @SPLAT_HD_MODE@
+#ifndef HD_MODE
+#define HD_MODE @SPLAT_HD_MODE@   /* legacy fallback for build scripts that still set SPLAT_HD_MODE */
+#endif
 
 /* Maximum analysis region, in square degrees.  Must be a perfect square
    from {1,4,9,16,25,36,49,64}.  Larger values need proportionally more
