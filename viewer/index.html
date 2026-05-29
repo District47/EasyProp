@@ -7,47 +7,125 @@
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin="">
 <style>
-  html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #map { height: 100%; }
+  /* Phase 19c: VSCode-style icon rail + tabbed sidebar layout.
+     Replaces the old single tall panel where every section was stacked on
+     top of every other section. Each task (Transmitter, Scenarios, Terrain,
+     About) gets its own focused tab; clicking the active icon collapses
+     the sidebar entirely so the map gets the full window. */
+  html, body {
+    height: 100%; margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a1a; color: #e0e0e0;
+    overflow: hidden;   /* don't scroll the whole page; only #sidebar */
+  }
+  #app { display: flex; height: 100%; }
+  #map  { flex: 1; height: 100%; background: #2a2a2a; }
 
-  .splat-panel {
-    background: rgba(255,255,255,0.97);
-    padding: 12px 14px;
-    border-radius: 6px;
-    box-shadow: 0 1px 6px rgba(0,0,0,0.3);
-    font-size: 12px;
-    width: 260px;
-    max-height: calc(100vh - 30px);
+  /* Icon rail: thin (48 px) vertical strip on the left with one button
+     per tab. Active tab is highlighted; collapse arrow lives at the bottom. */
+  #iconRail {
+    width: 48px; flex-shrink: 0;
+    background: #141414;
+    display: flex; flex-direction: column;
+    border-right: 1px solid #000;
+  }
+  #iconRail button {
+    height: 48px; width: 100%;
+    background: transparent; color: #888;
+    border: none; cursor: pointer;
+    font-size: 22px; line-height: 1;
+    position: relative;
+    border-left: 2px solid transparent;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+  }
+  #iconRail button:hover  { color: #fff; background: #1d1d1d; }
+  #iconRail button.active { color: #fff; border-left-color: #4aa3ff; background: #1d1d1d; }
+  #iconRail button .badge {
+    position: absolute; top: 8px; right: 6px;
+    min-width: 16px; height: 16px; line-height: 16px;
+    padding: 0 4px; border-radius: 8px;
+    background: #4aa3ff; color: #fff;
+    font-size: 9px; font-weight: 700; font-family: ui-sans-serif;
+    box-sizing: border-box;
+  }
+  #iconRail .spacer { flex: 1; }
+
+  /* Sidebar: 320 px wide content area, hidden when #app.collapsed. */
+  #sidebar {
+    width: 320px; flex-shrink: 0;
+    background: #1d1d1d;
+    border-right: 1px solid #000;
     overflow-y: auto;
+    display: flex; flex-direction: column;
   }
-  .splat-panel h3 { margin: 0 0 8px 0; font-size: 14px; }
-  .splat-panel h4 {
-    margin: 14px 0 4px 0; font-size: 10px; text-transform: uppercase;
-    color: #888; letter-spacing: 0.7px; border-bottom: 1px solid #eee; padding-bottom: 3px;
+  #app.collapsed #sidebar { display: none; }
+  /* Each tab is hidden by default; only the active one is visible. */
+  .tab { display: none; padding: 14px 16px; }
+  .tab.active { display: block; }
+  .tab h2 {
+    margin: 0 0 4px 0; font-size: 14px; font-weight: 600; color: #fafafa;
+    letter-spacing: 0.2px;
   }
-  .splat-panel label { display: block; margin-top: 5px; font-size: 11px; color: #444; }
-  .splat-panel input, .splat-panel select {
-    width: 100%; box-sizing: border-box; padding: 4px 6px;
+  .tab .tab-subtitle {
+    font-size: 11px; color: #888; margin-bottom: 14px;
+  }
+  .tab h4 {
+    margin: 16px 0 6px 0; font-size: 10px; text-transform: uppercase;
+    color: #888; letter-spacing: 0.8px; font-weight: 600;
+  }
+  .tab h4:first-of-type { margin-top: 4px; }
+  .tab label {
+    display: block; margin-top: 6px; font-size: 11px; color: #aaa;
+  }
+  .tab input[type="number"], .tab input[type="text"], .tab select {
+    width: 100%; box-sizing: border-box; padding: 5px 7px; margin-top: 2px;
     font-size: 12px; font-family: ui-monospace, Consolas, monospace;
-    margin-top: 2px;
+    background: #0f0f0f; color: #fafafa;
+    border: 1px solid #2a2a2a; border-radius: 3px;
   }
-  .splat-panel button {
-    width: 100%; padding: 7px; margin-top: 8px; font-size: 12px;
-    cursor: pointer; border: 1px solid #888; background: white; border-radius: 3px;
+  .tab input:focus, .tab select:focus {
+    border-color: #4aa3ff; outline: none;
   }
-  .splat-panel button.primary { background: #2c7; color: white; border-color: #2c7; font-weight: 600; }
-  .splat-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .splat-panel button.active { background: #fc6; border-color: #c80; }
-  .splat-panel .status {
-    padding: 6px 8px; margin-top: 8px; font-size: 11px;
-    background: #f3f3f3; border-radius: 3px; min-height: 14px;
+  .tab button {
+    width: 100%; padding: 7px 10px; margin-top: 8px;
+    font-size: 12px; font-family: inherit; cursor: pointer;
+    background: #2a2a2a; color: #fafafa;
+    border: 1px solid #3a3a3a; border-radius: 3px;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .tab button:hover:not(:disabled) { background: #333; border-color: #555; }
+  .tab button.primary {
+    background: #2c7a4a; border-color: #2c7a4a; font-weight: 600;
+  }
+  .tab button.primary:hover:not(:disabled) { background: #34925a; }
+  .tab button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .tab button.active   { background: #b87000; border-color: #b87000; color: #fff; }
+  .tab .status {
+    padding: 7px 9px; margin-top: 8px; font-size: 11px;
+    background: #111; border: 1px solid #2a2a2a;
+    border-radius: 3px; min-height: 16px; line-height: 1.45;
     font-family: ui-monospace, Consolas, monospace;
+    word-break: break-word;
   }
-  .splat-panel .status.busy { background: #ffc; }
-  .splat-panel .status.ok   { background: #dfd; }
-  .splat-panel .status.err  { background: #fdd; color: #a00; }
-  .splat-panel .row { display: flex; gap: 6px; }
-  .splat-panel .row > label { flex: 1; }
+  .tab .status.busy { background: #2a2310; border-color: #5a4a10; color: #ffd060; }
+  .tab .status.ok   { background: #122a17; border-color: #2a5a32; color: #80e090; }
+  .tab .status.err  { background: #2a1212; border-color: #5a2a2a; color: #ff7070; }
+  .tab .row  { display: flex; gap: 6px; align-items: stretch; }
+  .tab .row > label { flex: 1; }
+  .tab .row > * { margin-top: 6px; }
+  .tab hr {
+    border: none; border-top: 1px solid #2a2a2a; margin: 14px 0;
+  }
+  .tab a { color: #4aa3ff; text-decoration: none; }
+  .tab a:hover { text-decoration: underline; }
+
+  /* When a tab's overall mood is "you're not done setting up yet" -- e.g.
+     no TX placed -- the heading subtitle shows a hint banner. */
+  .hint-banner {
+    background: #1a2230; border: 1px solid #2a4060;
+    color: #8cbfff; font-size: 11px; padding: 6px 9px;
+    border-radius: 3px; margin-bottom: 10px;
+  }
 
   /* Phase 17c: toast notifications -- map-corner overlay for transient
      errors / info. Stacks bottom-up so the most recent toast is on top.
@@ -163,7 +241,170 @@
 </style>
 </head>
 <body>
-<div id="map"></div>
+<div id="app">
+  <!-- Phase 19c: VSCode-style icon rail. One button per tab; click the active
+       icon a second time to collapse the sidebar and give the map full width. -->
+  <aside id="iconRail">
+    <button data-tab="tx"        class="active" title="Transmitter (Alt+1)">📡</button>
+    <button data-tab="scenarios"                title="Scenarios (Alt+2)">📊<span class="badge" id="scenariosBadge" style="display:none;">0</span></button>
+    <button data-tab="terrain"                  title="Terrain (Alt+3)">🗺️</button>
+    <div class="spacer"></div>
+    <button data-tab="about" title="About (Alt+4)">ⓘ</button>
+    <button id="collapseBtn"  title="Collapse sidebar">◀</button>
+  </aside>
+
+  <!-- Tabbed sidebar. Exactly one .tab is .active at a time. -->
+  <section id="sidebar">
+
+    <!-- ============== Transmitter tab ============== -->
+    <div class="tab active" data-tab="tx">
+      <h2>Transmitter</h2>
+      <div class="tab-subtitle" id="txSubtitle">Place a pin to start.</div>
+
+      <button id="place">📍 Click map to set TX</button>
+      <div class="row">
+        <label>Lat <input id="lat" type="number" step="0.0001" placeholder="40.8022"></label>
+        <label>Lon <input id="lon" type="number" step="0.0001" placeholder="-74.2464"></label>
+      </div>
+
+      <h4>Radio</h4>
+      <label>Band <select id="band"></select></label>
+      <div class="row">
+        <label>Frequency (MHz) <input id="freq" type="number" step="0.1"></label>
+        <label>Power (W)       <input id="watts" type="number" step="0.1"></label>
+      </div>
+
+      <h4>Antenna</h4>
+      <label>Type <select id="ant"></select></label>
+      <div class="row">
+        <label>Gain (dBi)      <input id="gain" type="number" step="0.1"></label>
+        <label>Height AGL (m)  <input id="height" type="number" step="0.5" value="10"></label>
+      </div>
+
+      <h4>Analysis</h4>
+      <div class="row">
+        <label>Range (mi) <input id="range" type="number" step="1" value="30"></label>
+        <label style="display:flex;align-items:center;gap:6px;margin-top:18px;">
+          <input id="draft" type="checkbox"> Draft mode
+        </label>
+      </div>
+
+      <hr>
+
+      <div class="row">
+        <button id="compute" class="primary" disabled style="flex:2;">▶ Compute coverage</button>
+        <button id="computeCancel" style="flex:1;display:none;">Cancel</button>
+      </div>
+      <div id="status" class="status">Place a transmitter to begin.</div>
+      <div id="progress" class="splat-progress"><div class="fill"></div></div>
+      <div id="stage"    class="splat-stage"></div>
+      <div id="elapsed"  class="splat-stage" style="text-align:left;"></div>
+
+      <!-- Hidden compat input for settings persistence loop. -->
+      <input id="op" type="hidden" value="0.6">
+    </div>
+
+    <!-- ============== Scenarios tab ============== -->
+    <div class="tab" data-tab="scenarios">
+      <h2>Scenarios</h2>
+      <div class="tab-subtitle">Every cached compute is a toggleable overlay. Show multiple at once in different colors to compare.</div>
+
+      <div id="compCacheHeader" class="status">
+        <span style="opacity:0.7;">Loading&hellip;</span>
+      </div>
+      <div id="compCacheList" style="margin-top:8px;display:none;"></div>
+
+      <div class="row" style="margin-top:8px;">
+        <button id="compCacheRefresh">Refresh</button>
+        <button id="compCacheHideAll">Hide all</button>
+        <button id="compCacheClearAll" style="color:#ff8080;">Clear all</button>
+      </div>
+    </div>
+
+    <!-- ============== Terrain tab ============== -->
+    <div class="tab" data-tab="terrain">
+      <h2>Terrain cache</h2>
+      <div class="tab-subtitle">Pre-stage SRTM terrain so clicks are instant in your area of interest.</div>
+
+      <label style="display:flex;align-items:center;gap:6px;">
+        <input id="showCache" type="checkbox">
+        <span>Show cached tiles on map</span>
+      </label>
+      <div id="cacheStats" class="status">
+        <span style="opacity:0.7;">Loading cache status&hellip;</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;font-size:10px;color:#aaa;margin-top:6px;">
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#2ecc71;display:inline-block;border-radius:2px;opacity:0.55;"></span>HD + Draft
+        </span>
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#f1c40f;display:inline-block;border-radius:2px;opacity:0.55;"></span>Draft only
+        </span>
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#3498db;display:inline-block;border-radius:2px;opacity:0.55;"></span>HD only
+        </span>
+      </div>
+
+      <hr>
+
+      <h4>Build cache for region</h4>
+      <div class="row">
+        <select id="precacheRegion" style="flex:2;">
+          <option value="NE">Northeast US (~140 tiles, 6 GB)</option>
+          <option value="MidAtl">Mid-Atlantic (~54 tiles, 2 GB)</option>
+          <option value="CONUS">CONUS (~1450 tiles, 60 GB)</option>
+          <option value="view">Current map view</option>
+        </select>
+        <select id="precacheMode" style="flex:1;">
+          <option value="both">HD + Draft</option>
+          <option value="hd">HD only</option>
+          <option value="std">Draft only</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="precacheBtn" class="primary" style="flex:2;">Start precache</button>
+        <button id="precacheCancelBtn" style="flex:1;display:none;">Cancel</button>
+      </div>
+      <div id="precacheStatus"   class="status" style="display:none;"></div>
+      <div id="precacheProgress" class="splat-progress"><div class="fill"></div></div>
+    </div>
+
+    <!-- ============== About tab ============== -->
+    <div class="tab" data-tab="about">
+      <h2>EasyProp</h2>
+      <div class="tab-subtitle">Click-anywhere RF coverage viewer built on SPLAT! 1.4.2 + ITWOM.</div>
+
+      <h4>This release</h4>
+      <div class="status" id="aboutVersion">
+        Phase 19c &middot; VSCode-style UI<br>
+        <span style="color:#888;">Released v0.2.0</span>
+      </div>
+
+      <h4>Cache locations</h4>
+      <div class="status" style="font-size:10px;line-height:1.5;">
+        HD tiles &middot; %LOCALAPPDATA%\EasyProp\work-hd<br>
+        Draft tiles &middot; %LOCALAPPDATA%\EasyProp\work-std<br>
+        Computed PNGs &middot; %LOCALAPPDATA%\EasyProp\cache
+      </div>
+
+      <h4>Links</h4>
+      <div style="font-size:11px;line-height:1.7;">
+        <a href="https://github.com/District47/EasyProp" target="_blank">GitHub project</a><br>
+        <a href="https://github.com/District47/EasyProp/releases" target="_blank">Latest release</a><br>
+        <a href="https://www.qsl.net/kd2bd/splat.html" target="_blank">Upstream SPLAT! (KD2BD)</a>
+      </div>
+
+      <h4>Keyboard shortcuts</h4>
+      <div class="status" style="font-size:10px;line-height:1.55;">
+        Alt+1 / 2 / 3 / 4 &middot; switch tabs<br>
+        Alt+B &middot; collapse / expand sidebar
+      </div>
+    </div>
+
+  </section>
+
+  <div id="map"></div>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
@@ -247,136 +488,77 @@
     'custom': { label: 'Custom',                    freq: null,   watts: null, pol: 'V' }
   };
 
-  // ---------------- Side panel ----------------
-  const panel = L.control({ position: 'topright' });
-  panel.onAdd = () => {
-    const div = L.DomUtil.create('div', 'splat-panel');
-    const antOpts  = Object.entries(antennas).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('');
-    const bandOpts = Object.entries(bands   ).map(([k,v]) => `<option value="${k}">${v.label}</option>`).join('');
-    div.innerHTML = `
-      <h3>📡 SPLAT! Live Coverage</h3>
-
-      <h4>Transmitter</h4>
-      <button id="place">📍 Click map to set TX</button>
-      <div class="row">
-        <label>Lat <input id="lat" type="number" step="0.0001" placeholder="40.8022"></label>
-        <label>Lon <input id="lon" type="number" step="0.0001" placeholder="-74.2464"></label>
-      </div>
-
-      <h4>Radio</h4>
-      <label>Band <select id="band">${bandOpts}</select></label>
-      <label>Frequency (MHz) <input id="freq" type="number" step="0.1"></label>
-      <label>Power (W) <input id="watts" type="number" step="0.1"></label>
-
-      <h4>Antenna</h4>
-      <label>Type <select id="ant">${antOpts}</select></label>
-      <div class="row">
-        <label>Gain (dBi) <input id="gain" type="number" step="0.1"></label>
-        <label>Height AGL (m) <input id="height" type="number" step="0.5" value="10"></label>
-      </div>
-
-      <h4>Analysis</h4>
-      <label>Range (mi) <input id="range" type="number" step="1" value="30"></label>
-      <!-- Phase 14: Draft toggle. HD (1 arc-sec, default) runs at full
-           resolution; Draft (3 arc-sec) is ~17x faster but visibly chunkier
-           coverage edges. Requires the standard-resolution tile cache,
-           built once via utils/downsample_hd_to_std.ps1. -->
-      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#aaa;">
-        <input id="draft" type="checkbox">
-        Draft mode (faster, lower resolution)
-      </label>
-
-      <div class="row">
-        <button id="compute" class="primary" disabled style="flex:2;">Compute coverage</button>
-        <button id="computeCancel" style="flex:1;display:none;">Cancel</button>
-      </div>
-      <div id="status" class="status">Place a transmitter to begin.</div>
-      <div id="progress" class="splat-progress"><div class="fill"></div></div>
-      <div id="stage" class="splat-stage"></div>
-      <div id="elapsed" class="splat-stage" style="text-align:left;"></div>
-
-      <!-- Phase 19a: per-scenario opacity sliders replace the old global
-           Overlay > Opacity control. Kept as a hidden input so existing
-           code that reads opSlider.value (e.g. settings persistence) doesn't
-           blow up on a missing element. Value is no longer wired to any
-           overlay; per-scenario opacity is the only live opacity now. -->
-      <input id="op" type="hidden" value="0.6">
-
-      <!-- Phase 15: Terrain cache panel. Toggle drops one colored rectangle
-           per cached integer-degree tile onto the map so the user sees at a
-           glance which clicks will be fast vs trigger an auto-fetch. -->
-      <h4>Terrain cache</h4>
-      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#aaa;">
-        <input id="showCache" type="checkbox">
-        Show cached tiles on map
-      </label>
-      <div id="cacheStats" class="status" style="margin-top:6px;font-size:11px;line-height:1.45;">
-        <span style="opacity:0.7;">Loading cache status&hellip;</span>
-      </div>
-      <div style="display:flex;gap:8px;font-size:11px;color:#aaa;margin-top:4px;">
-        <span style="display:inline-flex;align-items:center;gap:4px;">
-          <span style="width:10px;height:10px;background:#2ecc71;display:inline-block;border-radius:2px;opacity:0.55;"></span> HD + Draft
-        </span>
-        <span style="display:inline-flex;align-items:center;gap:4px;">
-          <span style="width:10px;height:10px;background:#f1c40f;display:inline-block;border-radius:2px;opacity:0.55;"></span> Draft only
-        </span>
-        <span style="display:inline-flex;align-items:center;gap:4px;">
-          <span style="width:10px;height:10px;background:#3498db;display:inline-block;border-radius:2px;opacity:0.55;"></span> HD only
-        </span>
-      </div>
-
-      <!-- Phase 19a: scenarios as toggleable, comparable overlays.
-           Each cached compute result becomes its own L.imageOverlay you
-           can toggle on/off independently, with a per-scenario opacity
-           slider and a CSS hue-rotate so two scenarios visible at once
-           appear in distinct colors (red/orange/yellow/green/blue/violet).
-           Compare e.g. "30m mast" vs "50m mast" by toggling both ON and
-           seeing the larger-mast footprint extend outside the smaller one
-           in a different color. -->
-      <h4>Scenarios</h4>
-      <div id="compCacheHeader" class="status" style="font-size:11px;line-height:1.4;">
-        <span style="opacity:0.7;">Loading&hellip;</span>
-      </div>
-      <div id="compCacheList" style="font-size:11px;margin-top:6px;display:none;max-height:340px;overflow-y:auto;"></div>
-      <div class="row" style="margin-top:6px;">
-        <button id="compCacheRefresh"  style="flex:1;font-size:11px;">Refresh</button>
-        <button id="compCacheHideAll"  style="flex:1;font-size:11px;">Hide all</button>
-        <button id="compCacheClearAll" style="flex:1;font-size:11px;">Clear all</button>
-      </div>
-
-      <!-- Phase 16b: in-UI precache trigger. Lets the user kick off the same
-           work that utils\precache_srtm.ps1 + downsample_hd_to_std.ps1 do
-           from the CLI, without leaving the viewer. Each tile-completion
-           event from the server bumps a per-tile rectangle in the overlay
-           so the user can watch coverage fill in live. -->
-      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #333;">
-        <div style="font-size:11px;color:#aaa;margin-bottom:4px;">Build cache for region</div>
-        <div class="row" style="gap:4px;">
-          <select id="precacheRegion" style="flex:2;">
-            <option value="NE">Northeast US (140 tiles, ~6 GB)</option>
-            <option value="MidAtl">Mid-Atlantic (54 tiles, ~2 GB)</option>
-            <option value="CONUS">CONUS (~1450 tiles, ~60 GB)</option>
-            <option value="view">Current map view</option>
-          </select>
-          <select id="precacheMode" style="flex:1;">
-            <option value="both">HD + Draft</option>
-            <option value="hd">HD only</option>
-            <option value="std">Draft only</option>
-          </select>
-        </div>
-        <div class="row" style="margin-top:4px;">
-          <button id="precacheBtn"       style="flex:2;font-size:12px;">Start precache</button>
-          <button id="precacheCancelBtn" style="flex:1;font-size:12px;display:none;">Cancel</button>
-        </div>
-        <div id="precacheStatus" class="status" style="margin-top:4px;font-size:11px;line-height:1.4;display:none;"></div>
-        <div id="precacheProgress" class="splat-progress" style="margin-top:4px;display:none;"><div class="fill"></div></div>
-      </div>
-    `;
-    L.DomEvent.disableClickPropagation(div);
-    L.DomEvent.disableScrollPropagation(div);
-    return div;
-  };
-  panel.addTo(map);
+  // ---------------- Sidebar / tab plumbing (Phase 19c) ----------------
+  // The panel content now lives directly in the body's #sidebar element
+  // (no longer a Leaflet topright control). We just have to (a) populate
+  // the band+antenna <select> options, and (b) wire the icon-rail tab
+  // switching + collapse behavior + keyboard shortcuts. Every form ID
+  // matches the old panel so all downstream JS handlers Just Work.
+  document.getElementById('band').innerHTML = Object.entries(bands).map(
+    ([k,v]) => `<option value="${k}">${v.label}</option>`
+  ).join('');
+  document.getElementById('ant').innerHTML = Object.entries(antennas).map(
+    ([k,v]) => `<option value="${k}">${v.label}</option>`
+  ).join('');
+  // Stop Leaflet from interpreting clicks / scrolls on the rail+sidebar
+  // as map gestures (otherwise dragging a slider would pan the map).
+  const appEl = document.getElementById('app');
+  for (const el of [document.getElementById('iconRail'), document.getElementById('sidebar')]) {
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.disableScrollPropagation(el);
+  }
+  // Tab switching: clicking an icon-rail button shows that tab and hides
+  // the others. Clicking the active icon a second time collapses the
+  // sidebar entirely. Selection persists across reloads via localStorage.
+  const TAB_KEY = 'easyprop.activeTab.v1';
+  function setActiveTab(name) {
+    const buttons = document.querySelectorAll('#iconRail button[data-tab]');
+    const tabs    = document.querySelectorAll('#sidebar .tab');
+    buttons.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+    tabs.forEach(t    => t.classList.toggle('active', t.dataset.tab === name));
+    appEl.classList.remove('collapsed');
+    try { localStorage.setItem(TAB_KEY, name); } catch {}
+    // Map width just changed -- tell Leaflet so its tile bounds re-compute.
+    setTimeout(() => map.invalidateSize(), 50);
+  }
+  function toggleSidebar(forceCollapsed) {
+    const becoming = (forceCollapsed !== undefined) ? forceCollapsed
+                                                     : !appEl.classList.contains('collapsed');
+    appEl.classList.toggle('collapsed', becoming);
+    setTimeout(() => map.invalidateSize(), 50);
+  }
+  document.querySelectorAll('#iconRail button[data-tab]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.tab;
+      const alreadyActive = btn.classList.contains('active') && !appEl.classList.contains('collapsed');
+      if (alreadyActive) { toggleSidebar(true); }
+      else               { setActiveTab(name); }
+    });
+  });
+  document.getElementById('collapseBtn').addEventListener('click', () => toggleSidebar());
+  document.addEventListener('keydown', e => {
+    if (!e.altKey || e.ctrlKey || e.shiftKey || e.metaKey) return;
+    if (e.key === '1') { setActiveTab('tx');        e.preventDefault(); }
+    if (e.key === '2') { setActiveTab('scenarios'); e.preventDefault(); }
+    if (e.key === '3') { setActiveTab('terrain');   e.preventDefault(); }
+    if (e.key === '4') { setActiveTab('about');     e.preventDefault(); }
+    if (e.key === 'b' || e.key === 'B') { toggleSidebar(); e.preventDefault(); }
+  });
+  // Restore last-selected tab if any.
+  try {
+    const last = localStorage.getItem(TAB_KEY);
+    if (last && document.querySelector(`#iconRail button[data-tab="${last}"]`)) {
+      setActiveTab(last);
+    }
+  } catch {}
+  // Phase 19c: live badge on the Scenarios icon showing how many scenarios
+  // are currently visible. Updated whenever the scenarios list re-renders.
+  function updateScenariosBadge(visibleCount) {
+    const badge = document.getElementById('scenariosBadge');
+    if (visibleCount > 0) { badge.style.display = ''; badge.textContent = visibleCount; }
+    else                  { badge.style.display = 'none'; }
+  }
+  window._updateScenariosBadge = updateScenariosBadge;
 
   // ---------------- DOM refs ----------------
   const $       = id => document.getElementById(id);
@@ -522,6 +704,8 @@
     if (statusEl.textContent.startsWith('Place')) {
       setStatus(`TX at (${lat.toFixed(4)}, ${lon.toFixed(4)}). Click "Compute coverage".`);
     }
+    const sub = document.getElementById('txSubtitle');
+    if (sub) sub.textContent = `TX at ${lat.toFixed(4)}, ${lon.toFixed(4)} — adjust settings and Compute.`;
   }
   function setPlaceMode(on) {
     placeMode = on;
@@ -654,6 +838,8 @@
     compCacheHeader.innerHTML =
       `<b>${report.count}</b> scenario${report.count === 1 ? '' : 's'} cached, ` +
       `<b>${report.total_mb}</b> MB on disk · ${shownCount} visible`;
+    // Phase 19c: update the live "N visible" badge on the Scenarios tab icon
+    if (window._updateScenariosBadge) window._updateScenariosBadge(shownCount);
     compCacheList.innerHTML = '';
     if (report.count === 0) {
       compCacheList.style.display = 'none';
