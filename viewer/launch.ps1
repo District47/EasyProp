@@ -1226,6 +1226,31 @@ try {
                     try { & $emit @{ stage='error'; error=$_.Exception.Message } } catch {}
                 }
                 continue
+            } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -match '^/cache/compute/([a-fA-F0-9]+)\.(png|geo|json)$') {
+                # ---- /cache/compute/<key>.<ext> -- serve one cached file
+                # so each saved scenario can be its own overlay (Phase 18.5).
+                # The router above only serves files from $serveDir; cached
+                # PNGs live in $CacheDir, so we need this dedicated route.
+                $key = $Matches[1]; $ext = $Matches[2]
+                $file = Join-Path $CacheDir "$key.$ext"
+                if (Test-Path $file -PathType Leaf) {
+                    $ctype = switch ($ext) {
+                        'png'  { 'image/png' }
+                        'geo'  { 'text/plain; charset=utf-8' }
+                        'json' { 'application/json; charset=utf-8' }
+                    }
+                    $bytes = [System.IO.File]::ReadAllBytes($file)
+                    $res.ContentType = $ctype
+                    $res.ContentLength64 = $bytes.Length
+                    # Long-lived: keys are content-addressed (SHA-256), so a
+                    # given key's bytes never change. Lets the browser skip
+                    # re-fetching when toggling a scenario's visibility.
+                    $res.AddHeader('Cache-Control', 'public, max-age=31536000, immutable')
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                } else {
+                    $res.StatusCode = 404
+                }
+                $res.Close(); continue
             } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -eq '/cache/compute') {
                 # ---- /cache/compute -- list compute-cache entries (Phase 18)
                 $rep = Build-ComputeCacheReport -Dir $CacheDir

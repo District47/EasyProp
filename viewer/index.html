@@ -76,6 +76,54 @@
   .splat-toast .splat-toast-title { font-weight: 600; margin-bottom: 2px; }
   .splat-toast .splat-toast-hint  { font-size: 10px; opacity: 0.6; margin-top: 4px; }
 
+  /* Phase 19a: scenario cards. Each is a compact 4-line block showing one
+     cached compute result, with controls to toggle its overlay on the map,
+     adjust its opacity, change its color, give it a name, restore its
+     settings, or delete it. The 6-color palette is wired to CSS hue-rotate
+     filter values applied to the overlay PNG so two visible scenarios
+     don't visually merge. */
+  .splat-scenario {
+    border: 1px solid #333; border-radius: 4px; margin-bottom: 6px;
+    background: #1d1d1d; padding: 6px 8px;
+  }
+  .splat-scenario.active { border-color: #3aa; box-shadow: 0 0 0 1px #266 inset; }
+  .splat-scenario .row1, .splat-scenario .row2 {
+    display: flex; align-items: center; gap: 6px;
+  }
+  .splat-scenario .row1 { margin-bottom: 4px; }
+  .splat-scenario .swatch {
+    width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+    cursor: pointer; border: 1px solid rgba(255,255,255,0.3);
+    title: "Click to cycle color";
+  }
+  .splat-scenario .name {
+    flex: 1; background: #111; border: 1px solid #2a2a2a;
+    color: #fafafa; padding: 2px 6px; font-size: 11px; border-radius: 2px;
+    font-family: inherit;
+  }
+  .splat-scenario .name:focus { border-color: #555; outline: none; }
+  .splat-scenario .meta {
+    font-size: 10px; color: #aaa; line-height: 1.35;
+    margin-bottom: 4px; word-break: break-word;
+  }
+  .splat-scenario .meta b { color: #ddd; font-weight: 500; }
+  .splat-scenario .show-cb { margin: 0 4px 0 0; }
+  .splat-scenario .opacity {
+    flex: 1; height: 12px; cursor: pointer;
+  }
+  .splat-scenario button {
+    padding: 1px 6px; font-size: 10px; cursor: pointer;
+  }
+  .splat-scenario .del { color: #c66; border-color: #432; }
+  /* The 6-color palette swatches the user cycles through. Each maps to
+     a CSS hue-rotate degree applied to the L.imageOverlay PNG. */
+  .splat-swatch-0 { background: #ff5252; }   /* red (no rotate) */
+  .splat-swatch-1 { background: #ffaa33; }   /* orange */
+  .splat-swatch-2 { background: #ffd933; }   /* yellow */
+  .splat-swatch-3 { background: #33dd66; }   /* green */
+  .splat-swatch-4 { background: #4aa3ff; }   /* blue */
+  .splat-swatch-5 { background: #c266ff; }   /* violet */
+
   /* Progress bar -- shown only while a compute is in flight */
   .splat-progress {
     display: none;
@@ -132,9 +180,50 @@
   }).addTo(map);
 
   let txMarker = null;
-  let overlay  = null;
   let placeMode = false;
   let txLat = null, txLon = null;
+
+  // Phase 19a: per-scenario UI state (color, opacity, name, shown flag)
+  // keyed by the deterministic compute-cache key. Persisted to localStorage
+  // so a user's color/name choices survive across launcher restarts.
+  // Hue-rotate values are CSS filter degrees applied to each L.imageOverlay
+  // so two visible scenarios appear in distinct colors.
+  const SCENARIO_STATE_KEY = 'easyprop.scenarioState.v1';
+  const PALETTE_HUES = [0, 30, 60, 120, 200, 290];  // red orange yellow green blue violet
+  const scenarioState    = new Map();   // key -> { name, color, opacity, shown }
+  const scenarioOverlays = new Map();   // key -> { overlay, bounds }
+  // The "currently active" scenario -- the one a fresh Compute just produced
+  // or the one the user clicked "Load settings" on. Used for the row-active
+  // highlight + fitBounds behavior.
+  let activeScenarioKey = null;
+
+  function loadScenarioState() {
+    try {
+      const raw = localStorage.getItem(SCENARIO_STATE_KEY);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      for (const [k, v] of Object.entries(obj)) scenarioState.set(k, v);
+    } catch {}
+  }
+  function saveScenarioState() {
+    const obj = {};
+    for (const [k, v] of scenarioState) obj[k] = v;
+    try { localStorage.setItem(SCENARIO_STATE_KEY, JSON.stringify(obj)); } catch {}
+  }
+  function getScenarioState(key) {
+    if (!scenarioState.has(key)) {
+      // Auto-pick the next palette color so two-fresh-clicks gives two-different-colors.
+      const usedColors = new Set([...scenarioState.values()].map(s => s.color));
+      let color = 0;
+      for (let i = 0; i < PALETTE_HUES.length; i++) {
+        if (!usedColors.has(i)) { color = i; break; }
+      }
+      scenarioState.set(key, { name: '', color, opacity: 0.6, shown: false });
+      saveScenarioState();
+    }
+    return scenarioState.get(key);
+  }
+  loadScenarioState();
 
   // ---------------- Presets ----------------
   // Antenna presets: typical gain in dBi (relative to isotropic).
@@ -206,8 +295,12 @@
       <div id="stage" class="splat-stage"></div>
       <div id="elapsed" class="splat-stage" style="text-align:left;"></div>
 
-      <h4>Overlay</h4>
-      <label>Opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.6"></label>
+      <!-- Phase 19a: per-scenario opacity sliders replace the old global
+           Overlay > Opacity control. Kept as a hidden input so existing
+           code that reads opSlider.value (e.g. settings persistence) doesn't
+           blow up on a missing element. Value is no longer wired to any
+           overlay; per-scenario opacity is the only live opacity now. -->
+      <input id="op" type="hidden" value="0.6">
 
       <!-- Phase 15: Terrain cache panel. Toggle drops one colored rectangle
            per cached integer-degree tile onto the map so the user sees at a
@@ -232,17 +325,22 @@
         </span>
       </div>
 
-      <!-- Phase 18: previously-computed scenarios. Lists the cached PNGs
-           Phase 10 saves (key, TX coords, band/power, draft flag). Click
-           Load to restore the form state + place the TX; the next Compute
-           click will hit the cache so the round-trip is ~0.1 s. -->
-      <h4>Computed scenarios</h4>
+      <!-- Phase 19a: scenarios as toggleable, comparable overlays.
+           Each cached compute result becomes its own L.imageOverlay you
+           can toggle on/off independently, with a per-scenario opacity
+           slider and a CSS hue-rotate so two scenarios visible at once
+           appear in distinct colors (red/orange/yellow/green/blue/violet).
+           Compare e.g. "30m mast" vs "50m mast" by toggling both ON and
+           seeing the larger-mast footprint extend outside the smaller one
+           in a different color. -->
+      <h4>Scenarios</h4>
       <div id="compCacheHeader" class="status" style="font-size:11px;line-height:1.4;">
         <span style="opacity:0.7;">Loading&hellip;</span>
       </div>
-      <div id="compCacheList" style="font-size:11px;max-height:160px;overflow-y:auto;border:1px solid #333;border-radius:3px;margin-top:4px;display:none;"></div>
-      <div class="row" style="margin-top:4px;">
-        <button id="compCacheRefresh" style="flex:1;font-size:11px;">Refresh</button>
+      <div id="compCacheList" style="font-size:11px;margin-top:6px;display:none;max-height:340px;overflow-y:auto;"></div>
+      <div class="row" style="margin-top:6px;">
+        <button id="compCacheRefresh"  style="flex:1;font-size:11px;">Refresh</button>
+        <button id="compCacheHideAll"  style="flex:1;font-size:11px;">Hide all</button>
         <button id="compCacheClearAll" style="flex:1;font-size:11px;">Clear all</button>
       </div>
 
@@ -545,10 +643,17 @@
     const MM = String(d.getMinutes()).padStart(2, '0');
     return `${mm}/${dd} ${HH}:${MM}`;
   }
+  // Phase 19a: card-based scenario list. Each entry is a toggleable
+  // overlay you can independently show, recolor, fade, rename, or wipe.
+  // We hold onto _lastCompReport so hideAllScenarios() can re-render
+  // without an extra server round-trip.
+  let _lastCompReport = { count: 0, total_mb: 0, entries: [] };
   function renderCompCacheList(report) {
+    _lastCompReport = report;
+    const shownCount = report.entries.filter(e => scenarioState.get(e.key)?.shown).length;
     compCacheHeader.innerHTML =
-      `${report.count} scenario${report.count === 1 ? '' : 's'} cached, ` +
-      `${report.total_mb} MB on disk`;
+      `<b>${report.count}</b> scenario${report.count === 1 ? '' : 's'} cached, ` +
+      `<b>${report.total_mb}</b> MB on disk · ${shownCount} visible`;
     compCacheList.innerHTML = '';
     if (report.count === 0) {
       compCacheList.style.display = 'none';
@@ -556,33 +661,100 @@
     }
     compCacheList.style.display = 'block';
     for (const e of report.entries) {
-      const r = e.request || {};
-      const row = document.createElement('div');
-      row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 6px;border-bottom:1px solid #2a2a2a;';
-      const label = document.createElement('div');
-      label.style.cssText = 'flex:1;line-height:1.35;';
-      const draftBadge = r.draft ? ' <span style="background:#f1c40f;color:#000;padding:0 4px;border-radius:2px;font-size:10px;">DFT</span>' : '';
-      label.innerHTML =
-        `<div>${fmtCacheTs(e.cached_at)} &middot; ${r.lat?.toFixed(3)}, ${r.lon?.toFixed(3)}${draftBadge}</div>` +
-        `<div style="color:#999;font-size:10px;">${r.freq_mhz} MHz &middot; ${r.watts} W &middot; ${r.gain_dbi} dBi &middot; ${r.antenna_height_m} m &middot; ${r.range_mi} mi &middot; ${e.png_mb} MB</div>`;
-      const loadBtn = document.createElement('button');
-      loadBtn.textContent = 'Load';
-      loadBtn.style.cssText = 'font-size:10px;padding:2px 6px;';
-      loadBtn.addEventListener('click', () => loadCachedScenario(e));
-      const delBtn  = document.createElement('button');
-      delBtn.textContent = '×';
-      delBtn.title = 'Delete this cached scenario';
-      delBtn.style.cssText = 'font-size:12px;padding:2px 8px;color:#c44;';
-      delBtn.addEventListener('click', () => deleteCachedScenario(e.key));
-      row.appendChild(label);
-      row.appendChild(loadBtn);
-      row.appendChild(delBtn);
-      compCacheList.appendChild(row);
+      compCacheList.appendChild(buildScenarioCard(e));
     }
   }
-  function loadCachedScenario(entry) {
+  function fmtNameFallback(entry) {
     const r = entry.request || {};
-    // Restore form fields
+    return `${(r.lat ?? 0).toFixed(3)}, ${(r.lon ?? 0).toFixed(3)} · ${r.watts}W · ${r.antenna_height_m}m`;
+  }
+  function buildScenarioCard(entry) {
+    const key = entry.key;
+    const r   = entry.request || {};
+    const st  = getScenarioState(key);
+
+    const card = document.createElement('div');
+    card.className = 'splat-scenario' + (key === activeScenarioKey ? ' active' : '');
+    card.dataset.key = key;
+
+    // Row 1: color swatch · name input · delete button
+    const row1 = document.createElement('div'); row1.className = 'row1';
+    const sw = document.createElement('div');
+    sw.className = 'swatch splat-swatch-' + st.color;
+    sw.title = 'Click to cycle color';
+    sw.addEventListener('click', () => {
+      st.color = (st.color + 1) % PALETTE_HUES.length;
+      saveScenarioState();
+      sw.className = 'swatch splat-swatch-' + st.color;
+      applyScenarioStyle(key);
+    });
+    const nm = document.createElement('input');
+    nm.className = 'name'; nm.type = 'text';
+    nm.placeholder = fmtNameFallback(entry);
+    nm.value = st.name || '';
+    nm.addEventListener('input', () => { st.name = nm.value; saveScenarioState(); });
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '×';
+    del.title = 'Delete this cached scenario';
+    del.addEventListener('click', () => deleteCachedScenario(key));
+    row1.appendChild(sw); row1.appendChild(nm); row1.appendChild(del);
+
+    // Meta: full settings, on its own line
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const draftBadge = r.draft ? ' <span style="background:#f1c40f;color:#000;padding:0 3px;border-radius:2px;">DRAFT</span>' : '';
+    meta.innerHTML =
+      `<b>${(r.lat ?? 0).toFixed(4)}, ${(r.lon ?? 0).toFixed(4)}</b> · ${fmtCacheTs(entry.cached_at)}${draftBadge}<br>` +
+      `<b>${r.freq_mhz}</b> MHz · <b>${r.watts}</b> W · <b>${r.gain_dbi}</b> dBi · ` +
+      `<b>${r.antenna_height_m}</b> m AGL · <b>${r.range_mi}</b> mi · ${entry.png_mb} MB`;
+
+    // Row 2: show checkbox · opacity slider · load-settings button
+    const row2 = document.createElement('div'); row2.className = 'row2';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'show-cb'; cb.checked = !!st.shown;
+    cb.title = 'Toggle this scenario\'s overlay on the map';
+    cb.addEventListener('change', async () => {
+      if (cb.checked) {
+        await showScenario(key);
+      } else {
+        hideScenario(key);
+      }
+      renderCompCacheList(_lastCompReport);
+    });
+    const cbLabel = document.createElement('label');
+    cbLabel.style.cssText = 'display:flex;align-items:center;font-size:11px;color:#bbb;cursor:pointer;';
+    cbLabel.appendChild(cb);
+    cbLabel.appendChild(document.createTextNode('Show'));
+
+    const op = document.createElement('input');
+    op.className = 'opacity'; op.type = 'range';
+    op.min = 0; op.max = 1; op.step = 0.05; op.value = st.opacity;
+    op.title = 'Overlay opacity for this scenario';
+    op.addEventListener('input', () => {
+      st.opacity = +op.value; saveScenarioState();
+      applyScenarioStyle(key);
+    });
+
+    const loadBtn = document.createElement('button');
+    loadBtn.textContent = 'Load settings';
+    loadBtn.title = 'Restore TX position + form values to match this scenario (does NOT toggle overlay)';
+    loadBtn.addEventListener('click', () => loadScenarioSettings(entry));
+
+    row2.appendChild(cbLabel); row2.appendChild(op); row2.appendChild(loadBtn);
+
+    card.appendChild(row1); card.appendChild(meta); card.appendChild(row2);
+
+    // Re-show the overlay if state says it's shown but the layer isn't on
+    // the map yet (e.g. first render after a page reload that restored
+    // state from localStorage). Fire-and-forget; the user sees the overlay
+    // appear when the PNG loads.
+    if (st.shown && !map.hasLayer((scenarioOverlays.get(key) || {}).overlay)) {
+      showScenario(key);
+    }
+    return card;
+  }
+  function loadScenarioSettings(entry) {
+    const r = entry.request || {};
     if (r.freq_mhz       !== undefined) freqInp.value   = r.freq_mhz;
     if (r.watts          !== undefined) wattsInp.value  = r.watts;
     if (r.gain_dbi       !== undefined) gainInp.value   = r.gain_dbi;
@@ -590,17 +762,25 @@
     if (r.range_mi       !== undefined) rangeInp.value  = r.range_mi;
     if (r.draft          !== undefined) document.getElementById('draft').checked = r.draft;
     saveSettings();
-    // Place the TX (also pans the map appropriately via existing setTx logic)
     if (r.lat !== undefined && r.lon !== undefined) {
       setTx(r.lat, r.lon);
       map.setView([r.lat, r.lon], Math.max(map.getZoom(), 9));
     }
-    toast('Settings restored. Click "Compute coverage" to fetch from cache.', {
-      kind: 'info', title: 'Scenario loaded'
+    activeScenarioKey = entry.key;
+    renderCompCacheList(_lastCompReport);
+    toast('Form restored. Click Compute to re-run (cache hit, ~0.1s).', {
+      kind: 'info', title: 'Loaded settings'
     });
   }
   async function deleteCachedScenario(key) {
     try {
+      // Take the overlay off the map first; otherwise it would be a dangling
+      // <img src=/cache/compute/...> referencing a file that no longer exists.
+      hideScenario(key);
+      scenarioOverlays.delete(key);
+      scenarioState.delete(key);
+      saveScenarioState();
+
       const r = await fetch('/cache/compute/' + encodeURIComponent(key), { method: 'DELETE' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const out = await r.json();
@@ -622,9 +802,18 @@
     }
   }
   compCacheRefresh.addEventListener('click', refreshCompCache);
+  document.getElementById('compCacheHideAll').addEventListener('click', () => {
+    hideAllScenarios();
+  });
   compCacheClearAll.addEventListener('click', async () => {
-    if (!confirm('Wipe ALL cached compute scenarios?\n\nThis deletes every cached PNG/geo/sidecar from %LOCALAPPDATA%\\EasyProp\\cache\\. Settings tiles (terrain) are not touched.')) return;
+    if (!confirm('Wipe ALL cached compute scenarios?\n\nThis deletes every cached PNG/geo/sidecar from %LOCALAPPDATA%\\EasyProp\\cache\\. Terrain tiles are not touched.')) return;
     try {
+      // Drop every overlay + state first; the dir is about to be empty so any
+      // remaining <img> references would just 404.
+      for (const key of [...scenarioOverlays.keys()]) hideScenario(key);
+      scenarioOverlays.clear();
+      scenarioState.clear();
+      saveScenarioState();
       const r = await fetch('/cache/compute', { method: 'DELETE' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const out = await r.json();
@@ -820,7 +1009,8 @@
   });
 
   // ---------------- Compute ----------------
-  async function loadOverlay(pngUrl, geoUrl) {
+  // Parse a SPLAT .geo file's two TIEPOINT lines into Leaflet bounds.
+  async function fetchGeoBounds(geoUrl) {
     const txt = await (await fetch(geoUrl)).text();
     const tps = txt.split('\n').filter(l => l.startsWith('TIEPOINT')).map(l => {
       const f = l.split(/\s+/);
@@ -828,15 +1018,57 @@
     });
     if (tps.length < 2) throw new Error('bad .geo (no TIEPOINT lines)');
     const lats = tps.map(p => p.lat), lons = tps.map(p => p.lon);
-    const bounds = [
-      [Math.min(...lats), Math.min(...lons)],
-      [Math.max(...lats), Math.max(...lons)]
-    ];
-    if (overlay) map.removeLayer(overlay);
-    overlay = L.imageOverlay(pngUrl, bounds, {
-      opacity: +opSlider.value, interactive: false
-    }).addTo(map);
-    return bounds;
+    return [[Math.min(...lats), Math.min(...lons)],
+            [Math.max(...lats), Math.max(...lons)]];
+  }
+  // Apply a scenario's current state to its on-map overlay (opacity + hue
+  // rotation). No-op if the scenario isn't currently visible.
+  function applyScenarioStyle(key) {
+    const st = scenarioState.get(key);
+    const ov = scenarioOverlays.get(key);
+    if (!st || !ov) return;
+    ov.overlay.setOpacity(st.opacity);
+    const el = ov.overlay.getElement();
+    if (el) {
+      el.style.filter = PALETTE_HUES[st.color] === 0
+        ? ''
+        : `hue-rotate(${PALETTE_HUES[st.color]}deg)`;
+    }
+  }
+  // Add a scenario's overlay to the map (lazy-loading the geo bounds + PNG
+  // on first show; subsequent shows reuse the cached overlay object).
+  async function showScenario(key) {
+    const st = getScenarioState(key);
+    st.shown = true; saveScenarioState();
+    if (!scenarioOverlays.has(key)) {
+      let bounds;
+      try {
+        bounds = await fetchGeoBounds(`/cache/compute/${key}.geo`);
+      } catch (e) {
+        toast(`Couldn't load /${key}.geo: ${e.message}`, { kind: 'error' });
+        st.shown = false; saveScenarioState();
+        return null;
+      }
+      const overlay = L.imageOverlay(`/cache/compute/${key}.png`, bounds, {
+        opacity: st.opacity, interactive: false
+      });
+      scenarioOverlays.set(key, { overlay, bounds });
+    }
+    const ov = scenarioOverlays.get(key);
+    ov.overlay.addTo(map);
+    // Wait one frame for the <img> element to exist, then apply hue filter.
+    requestAnimationFrame(() => applyScenarioStyle(key));
+    return ov.bounds;
+  }
+  function hideScenario(key) {
+    const st = scenarioState.get(key);
+    if (st) { st.shown = false; saveScenarioState(); }
+    const ov = scenarioOverlays.get(key);
+    if (ov && map.hasLayer(ov.overlay)) map.removeLayer(ov.overlay);
+  }
+  function hideAllScenarios() {
+    for (const key of [...scenarioOverlays.keys()]) hideScenario(key);
+    renderCompCacheList(_lastCompReport);
   }
 
   // --- Progress bar plumbing ---
@@ -1007,9 +1239,16 @@
       if (terminal.kind === 'error') throw new Error(terminal.event.error || 'unknown error');
 
       const ev = terminal.event;
-      const ts = Date.now();
-      const bounds = await loadOverlay(`live.png?t=${ts}`, `live.geo?t=${ts}`);
-      map.fitBounds(bounds);
+      // Phase 19a: instead of clobbering one "live" overlay, this result is a
+      // scenario in its own right. Add it to the panel (refresh fetches the
+      // updated list), mark it shown, optionally fit the map to it, and
+      // leave any previously-shown scenarios alone -- so a sequence of
+      // computes builds up a comparison stack.
+      const key = ev.cache_key;
+      const st  = getScenarioState(key);
+      activeScenarioKey = key;
+      const bounds = await showScenario(key);
+      if (bounds) map.fitBounds(bounds);
 
       const dtTotal = ((performance.now() - t0) / 1000).toFixed(1);
       if (ev.cached) {
@@ -1034,9 +1273,11 @@
             fetchCacheReport().then(renderCacheStats);
           }
         }
-        // Phase 18: a fresh compute lands one new entry in the compute cache.
-        refreshCompCache();
       }
+      // Always refresh the scenarios list so the fresh result shows up (and
+      // duplicates of the same key dedupe automatically since the list is
+      // keyed by hash).
+      refreshCompCache();
     } catch (e) {
       if (e.name === 'AbortError') {
         setStatus('Cancelled.', 'err');
@@ -1058,18 +1299,12 @@
     }
   });
 
-  opSlider.addEventListener('input', e => {
-    if (overlay) overlay.setOpacity(parseFloat(e.target.value));
-  });
-
-  // ---------------- Initial overlay (if a pre-existing file is named) ----------------
-  try {
-    const r = await fetch(`${initialName}.geo`);
-    if (r.ok) {
-      const bounds = await loadOverlay(`${initialName}.png`, `${initialName}.geo`);
-      map.fitBounds(bounds);
-    }
-  } catch { /* no initial overlay; that's fine */ }
+  // Phase 19a: opSlider no longer drives any live overlay (kept as a hidden
+  // input only so the settings-persistence loop doesn't NPE on the missing
+  // element). Per-scenario opacity sliders inside each card do the job.
+  // The legacy "auto-load an initial preview from <initialName>.png" path
+  // is also gone -- the Scenarios panel handles restoring any prior overlays
+  // via its persisted state.
 })();
 </script>
 </body>
