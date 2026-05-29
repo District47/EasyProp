@@ -249,6 +249,90 @@ function Get-SdfName {
     '{0}_{1}_{2}_{3}-hd.sdf' -f $Lat, ($Lat+1), ($West-1), $West
 }
 
+function Build-CacheReport {
+    # Phase 15: walk the HD and STD tile dirs and return a per-tile summary
+    # the viewer renders as a colored overlay (one rectangle per cached
+    # integer-degree tile, colored by HD/STD/both). Also returns aggregate
+    # totals for the cache panel header.
+    #
+    # Tile filename convention (from Get-SdfName / fetch_srtm.ps1):
+    #   HD : <LAT>_<LAT+1>_<W-1>_<W>-hd.sdf
+    #   STD: <LAT>_<LAT+1>_<W-1>_<W>.sdf
+    # We reverse-parse those four ints to recover (LAT, W) for each on-disk
+    # file, union the two sets, and emit one entry per tile with hd/std
+    # boolean flags. Returns a hashtable ready for ConvertTo-Json.
+    param([string]$HdDir, [string]$StdDir)
+
+    $byKey = @{}   # key = "lat,west" -> @{ lat; west; hd; std; hd_bytes; std_bytes }
+
+    function _accumulate {
+        param([string]$Dir, [string]$Pattern, [string]$Field, [string]$BytesField)
+        if (-not (Test-Path $Dir)) { return }
+        foreach ($f in Get-ChildItem $Dir -Filter $Pattern -ErrorAction SilentlyContinue) {
+            # Match "<lat>_<lat+1>_<w-1>_<w>" prefix, ignore any -hd suffix.
+            if ($f.BaseName -match '^(\d+)_(\d+)_(\d+)_(\d+)(?:-hd)?$') {
+                $lat  = [int]$Matches[1]
+                $west = [int]$Matches[4]   # 4th int is the W from the HGT name
+                $key  = "$lat,$west"
+                if (-not $byKey.ContainsKey($key)) {
+                    $byKey[$key] = @{
+                        lat=$lat; west=$west; hd=$false; std=$false;
+                        hd_bytes=0; std_bytes=0
+                    }
+                }
+                $byKey[$key][$Field]      = $true
+                $byKey[$key][$BytesField] = [int64]$f.Length
+            }
+        }
+    }
+    # Filter the STD pass to *.sdf only -- Get-ChildItem's -Filter '*.sdf'
+    # in Windows matches BOTH foo.sdf and foo-hd.sdf (NTFS shortname
+    # matching), so strip -hd files defensively even if the dirs are
+    # accidentally pointed at each other.
+    _accumulate -Dir $HdDir  -Pattern '*-hd.sdf' -Field 'hd'  -BytesField 'hd_bytes'
+    if (Test-Path $StdDir) {
+        foreach ($f in (Get-ChildItem $StdDir -Filter '*.sdf' -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -notmatch '-hd\.sdf$' })) {
+            if ($f.BaseName -match '^(\d+)_(\d+)_(\d+)_(\d+)$') {
+                $lat  = [int]$Matches[1]
+                $west = [int]$Matches[4]
+                $key  = "$lat,$west"
+                if (-not $byKey.ContainsKey($key)) {
+                    $byKey[$key] = @{
+                        lat=$lat; west=$west; hd=$false; std=$false;
+                        hd_bytes=0; std_bytes=0
+                    }
+                }
+                $byKey[$key].std       = $true
+                $byKey[$key].std_bytes = [int64]$f.Length
+            }
+        }
+    }
+
+    # Aggregate counters. Measure-Object can't reach into hashtable values
+    # via -Property (it only resolves real properties on PSCustomObject-like
+    # inputs), so unpack into a plain pipeline first.
+    $hdN  = ($byKey.Values | Where-Object { $_.hd  }).Count
+    $stdN = ($byKey.Values | Where-Object { $_.std }).Count
+    $hdMb = [math]::Round((($byKey.Values | ForEach-Object { $_.hd_bytes  } |
+                              Measure-Object -Sum).Sum / 1MB), 1)
+    $stMb = [math]::Round((($byKey.Values | ForEach-Object { $_.std_bytes } |
+                              Measure-Object -Sum).Sum / 1MB), 1)
+
+    return @{
+        hd_dir  = $HdDir
+        std_dir = $StdDir
+        tiles   = @($byKey.Values | Sort-Object { $_.lat * 1000 + $_.west })
+        totals  = @{
+            tile_count = $byKey.Count
+            hd_count   = $hdN
+            std_count  = $stdN
+            hd_mb      = $hdMb
+            std_mb     = $stMb
+        }
+    }
+}
+
 function Get-EffectiveDegLimit {
     # Phase 13: shrink splat's analysis bbox to ~just-cover the user's
     # coverage radius (plus a small margin so the disc isn't clipped at
@@ -819,6 +903,20 @@ try {
                     } catch { Write-Host "  ERROR (post-stream): $($_.Exception.Message)" -ForegroundColor Red }
                 }
 
+            } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -eq '/cache') {
+                # ---- /cache -- tile-coverage report (Phase 15) -----------
+                # Returns a JSON snapshot of which integer-degree tiles are
+                # cached in HD and/or STD. The browser draws this as a
+                # colored overlay layer on the Leaflet map so the user
+                # knows at a glance which clicks will be fast.
+                $report = Build-CacheReport -HdDir $SdfDir -StdDir $StdSdfDir
+                $json   = $report | ConvertTo-Json -Depth 6 -Compress
+                $bytes  = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType   = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                $res.Close()
+                continue
             } else {
                 # ---- static GET ----
                 $rel = [System.Uri]::UnescapeDataString($req.Url.LocalPath.TrimStart('/'))

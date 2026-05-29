@@ -178,6 +178,29 @@
 
       <h4>Overlay</h4>
       <label>Opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.6"></label>
+
+      <!-- Phase 15: Terrain cache panel. Toggle drops one colored rectangle
+           per cached integer-degree tile onto the map so the user sees at a
+           glance which clicks will be fast vs trigger an auto-fetch. -->
+      <h4>Terrain cache</h4>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#aaa;">
+        <input id="showCache" type="checkbox">
+        Show cached tiles on map
+      </label>
+      <div id="cacheStats" class="status" style="margin-top:6px;font-size:11px;line-height:1.45;">
+        <span style="opacity:0.7;">Loading cache status&hellip;</span>
+      </div>
+      <div style="display:flex;gap:8px;font-size:11px;color:#aaa;margin-top:4px;">
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#2ecc71;display:inline-block;border-radius:2px;opacity:0.55;"></span> HD + Draft
+        </span>
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#f1c40f;display:inline-block;border-radius:2px;opacity:0.55;"></span> Draft only
+        </span>
+        <span style="display:inline-flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;background:#3498db;display:inline-block;border-radius:2px;opacity:0.55;"></span> HD only
+        </span>
+      </div>
     `;
     L.DomEvent.disableClickPropagation(div);
     L.DomEvent.disableScrollPropagation(div);
@@ -200,6 +223,8 @@
   const compBtn = $('compute');
   const statusEl= $('status');
   const opSlider= $('op');
+  const showCacheCb = $('showCache');
+  const cacheStatsEl = $('cacheStats');
 
   // Initialise presets
   bandSel.value = 'gmrs';
@@ -262,6 +287,86 @@
   }
   latInp.addEventListener('change', maybeUpdateFromInputs);
   lonInp.addEventListener('change', maybeUpdateFromInputs);
+
+  // ---------------- Terrain cache overlay (Phase 15) ----------------
+  // Lazy-fetched + cached for the session. Each cached tile is rendered as
+  // a 1-degree Leaflet rectangle colored by what's on disk:
+  //   green = both HD and Draft tiles present (click is fast in either mode)
+  //   yellow = Draft only (HD click would auto-fetch)
+  //   blue = HD only (Draft click would sea-level-fill)
+  // Anywhere on the map WITHOUT a colored rectangle has nothing cached at
+  // all, so the first click in that area will trigger an SRTM fetch (HD)
+  // or sea-level fill (Draft).
+  const cacheLayer = L.layerGroup();
+  let cacheLoadPromise = null;
+  function fetchCacheReport() {
+    if (!cacheLoadPromise) {
+      cacheLoadPromise = fetch('/cache')
+        .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+        .catch(e => { cacheLoadPromise = null; throw e; });
+    }
+    return cacheLoadPromise;
+  }
+  function renderCacheStats(report) {
+    const t = report.totals;
+    const gb = mb => mb >= 1024 ? (mb/1024).toFixed(2) + ' GB' : mb.toFixed(0) + ' MB';
+    cacheStatsEl.innerHTML =
+      `${t.tile_count} tile${t.tile_count === 1 ? '' : 's'} cached ` +
+      `&middot; HD ${t.hd_count} (${gb(t.hd_mb)}) ` +
+      `&middot; Draft ${t.std_count} (${gb(t.std_mb)})`;
+  }
+  function tileColor(tile) {
+    if (tile.hd && tile.std) return '#2ecc71';   // green
+    if (tile.std)            return '#f1c40f';   // yellow
+    if (tile.hd)             return '#3498db';   // blue
+    return null;                                  // not drawn
+  }
+  function populateCacheLayer(report) {
+    cacheLayer.clearLayers();
+    for (const tile of report.tiles) {
+      const color = tileColor(tile);
+      if (!color) continue;
+      // Tile N<lat>W<west> covers latitudes [lat, lat+1] and east-longitudes
+      // [-west, -(west-1)] (since `west` here is the splat positive-west
+      // convention). Leaflet wants [[south, west_east], [north, east_east]].
+      const bounds = [[tile.lat, -tile.west], [tile.lat + 1, -(tile.west - 1)]];
+      const rect = L.rectangle(bounds, {
+        color: color, weight: 0.5, opacity: 0.6,
+        fillColor: color, fillOpacity: 0.18,
+        interactive: true
+      });
+      const hdMb  = (tile.hd_bytes  / (1024*1024)).toFixed(1);
+      const stdMb = (tile.std_bytes / (1024*1024)).toFixed(1);
+      const tileName = `N${String(tile.lat).padStart(2,'0')}W${String(tile.west).padStart(3,'0')}`;
+      rect.bindTooltip(
+        `<b>${tileName}</b><br>` +
+        `HD: ${tile.hd ? hdMb + ' MB' : '—'}<br>` +
+        `Draft: ${tile.std ? stdMb + ' MB' : '—'}`,
+        { sticky: true });
+      rect.addTo(cacheLayer);
+    }
+  }
+  showCacheCb.addEventListener('change', async () => {
+    if (showCacheCb.checked) {
+      cacheStatsEl.textContent = 'Loading…';
+      try {
+        const report = await fetchCacheReport();
+        renderCacheStats(report);
+        populateCacheLayer(report);
+        cacheLayer.addTo(map);
+      } catch (e) {
+        cacheStatsEl.textContent = 'Failed: ' + e;
+        showCacheCb.checked = false;
+      }
+    } else {
+      map.removeLayer(cacheLayer);
+    }
+  });
+  // Always load the headline stats once on page load (cheap, ~140 file stats).
+  // The user can then opt into the visual overlay without waiting for fetch.
+  fetchCacheReport()
+    .then(renderCacheStats)
+    .catch(e => { cacheStatsEl.textContent = 'Cache status unavailable: ' + e; });
 
   // ---------------- Compute ----------------
   async function loadOverlay(pngUrl, geoUrl) {
@@ -455,6 +560,18 @@
           ? ` · fetched ${ev.tiles_fetched} SRTM tile${ev.tiles_fetched > 1 ? 's' : ''} (${ev.fetch_sec.toFixed(1)}s)`
           : (ev.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
         setStatus(`Done ${dtTotal}s · splat ${ev.elapsed_sec.toFixed(1)}s${fetchNote} · cached as ${ev.cache_key}`, 'ok');
+        // Phase 15: HD auto-fetch may have added tiles to disk. Bust the
+        // session-level cache report so the next overlay toggle / stats
+        // refresh sees the new tiles. Cheap; we only refresh if the panel
+        // is already open.
+        if (ev.tiles_fetched > 0) {
+          cacheLoadPromise = null;
+          if (showCacheCb.checked) {
+            fetchCacheReport().then(r => { renderCacheStats(r); populateCacheLayer(r); });
+          } else {
+            fetchCacheReport().then(renderCacheStats);
+          }
+        }
       }
     } catch (e) {
       setStatus('FAIL: ' + e.message, 'err');
