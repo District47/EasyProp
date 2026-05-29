@@ -249,6 +249,164 @@ function Get-SdfName {
     '{0}_{1}_{2}_{3}-hd.sdf' -f $Lat, ($Lat+1), ($West-1), $West
 }
 
+$script:REGION_PRESETS = @{
+    NE     = @{ MinLat = 38; MaxLat = 47; MinWest = 68; MaxWest = 81 }
+    MidAtl = @{ MinLat = 36; MaxLat = 41; MinWest = 73; MaxWest = 81 }
+    CONUS  = @{ MinLat = 24; MaxLat = 48; MinWest = 67; MaxWest = 124 }
+}
+
+function Resolve-PrecacheBbox {
+    # Phase 16b: turn a /cache/precache request body into integer-tile
+    # bounds. Accepts either { region: "NE"|"MidAtl"|"CONUS" } or a custom
+    # box { minLat, maxLat, minWest, maxWest }. Returns the same shape the
+    # presets use plus a label for logging/UI.
+    param([pscustomobject]$Req)
+    if ($Req.region -and $script:REGION_PRESETS.ContainsKey($Req.region)) {
+        $box = $script:REGION_PRESETS[$Req.region].Clone()
+        $box.Label = $Req.region
+        return $box
+    }
+    # Custom: take the four corners as-is (caller already snapped to ints).
+    if ($null -ne $Req.minLat -and $null -ne $Req.maxLat -and
+        $null -ne $Req.minWest -and $null -ne $Req.maxWest) {
+        return @{
+            MinLat  = [int]$Req.minLat
+            MaxLat  = [int]$Req.maxLat
+            MinWest = [int]$Req.minWest
+            MaxWest = [int]$Req.maxWest
+            Label   = "custom ($($Req.minLat)..$($Req.maxLat) N, $($Req.minWest)..$($Req.maxWest) W)"
+        }
+    }
+    throw "precache request needs either a region preset or minLat/maxLat/minWest/maxWest"
+}
+
+function Invoke-PrecacheStreaming {
+    # End-to-end precache pipeline. Stream events:
+    #   setup            -- bbox resolved, tile counts known
+    #   fetch_start      -- HD-phase begins (only if mode includes 'hd')
+    #   fetch_progress   -- one per tile as it lands
+    #   fetch_done       -- HD phase complete
+    #   downsample_start -- STD-phase begins (only if mode includes 'std')
+    #   downsample_progress -- one per tile downsampled
+    #   downsample_done
+    #   done
+    #   error            -- anywhere, terminates the stream
+    param([pscustomobject]$Req, [scriptblock]$EmitEvent)
+
+    $box  = Resolve-PrecacheBbox -Req $Req
+    $mode = if ($Req.mode) { "$($Req.mode)" } else { 'both' }
+    if ($mode -notin @('hd','std','both')) { $mode = 'both' }
+
+    # Build the integer-tile grid (Lat, West) for the bbox.
+    $tiles = New-Object 'System.Collections.Generic.List[object]'
+    for ($la = $box.MinLat; $la -le $box.MaxLat; $la++) {
+        for ($w = $box.MinWest; $w -le $box.MaxWest; $w++) {
+            $tiles.Add([pscustomobject]@{ Lat=$la; West=$w })
+        }
+    }
+    & $EmitEvent @{
+        stage      = 'setup'
+        message    = "Precache $($box.Label): $($tiles.Count) tile grid, mode=$mode"
+        bbox       = $box
+        mode       = $mode
+        tile_count = $tiles.Count
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # ---- HD phase --------------------------------------------------------
+    $hdOk = 0; $hdSkip = 0; $hdFail = 0
+    if ($mode -in @('hd','both')) {
+        try {
+            $tally = Fetch-MissingTilesAsync -Tiles $tiles -OutDir $SdfDir `
+                          -SrtmToolPath $SrtmTool -EmitEvent $EmitEvent
+            $hdOk = $tally.ok; $hdSkip = $tally.skipped; $hdFail = $tally.failed
+        } catch {
+            & $EmitEvent @{ stage='error'; error="HD fetch failed: $($_.Exception.Message)" }
+            return
+        }
+    }
+
+    # ---- STD phase: downsample HD -> STD for every tile that lacks one --
+    $stdOk = 0; $stdSkip = 0; $stdFail = 0
+    if ($mode -in @('std','both')) {
+        if (-not (Test-Path $StdSdfDir)) {
+            New-Item -ItemType Directory -Path $StdSdfDir -Force | Out-Null
+        }
+        # Locate the downsample tool. It lives alongside srtm2sdf-hd in our
+        # build tree, and alongside it in the release bin\ dir.
+        $sdfTool = Join-Path (Split-Path $SrtmTool -Parent) 'sdf_hd_to_std.exe'
+        if (-not (Test-Path $sdfTool)) {
+            & $EmitEvent @{ stage='error'; error="sdf_hd_to_std.exe not found next to $SrtmTool" }
+            return
+        }
+        $needed = @()
+        foreach ($t in $tiles) {
+            $hdName  = Get-SdfName -Lat $t.Lat -West $t.West
+            $stdName = $hdName -replace '-hd\.sdf$','.sdf'
+            $hdPath  = Join-Path $SdfDir   $hdName
+            $stdPath = Join-Path $StdSdfDir $stdName
+            if (Test-Path $stdPath)      { continue }            # already done
+            if (-not (Test-Path $hdPath)) { continue }           # nothing to source from
+            $needed += [pscustomobject]@{ Lat=$t.Lat; West=$t.West; Src=$hdPath; Dst=$stdPath }
+        }
+        & $EmitEvent @{
+            stage            = 'downsample_start'
+            tiles_total      = $tiles.Count
+            tiles_to_make    = $needed.Count
+            tiles_already    = $tiles.Count - $needed.Count
+        }
+
+        # Sequential downsample is fast enough (~2 s/tile) and keeps the
+        # event stream ordered + the box's CPU calm. Parallelism could be
+        # added later (mirror Fetch-MissingTilesAsync) if precaching big
+        # regions becomes a UX pain.
+        $done = 0
+        foreach ($t in $needed) {
+            $tile = 'N{0:D2}W{1:D3}' -f $t.Lat, $t.West
+            & $sdfTool $t.Src $t.Dst 2>&1 | Out-Null
+            $done++
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $t.Dst)) {
+                $stdOk++
+                & $EmitEvent @{
+                    stage       = 'downsample_progress'
+                    tiles_done  = $done
+                    tiles_total = $needed.Count
+                    tile        = $tile
+                    status      = 'ok'
+                }
+            } else {
+                $stdFail++
+                & $EmitEvent @{
+                    stage       = 'downsample_progress'
+                    tiles_done  = $done
+                    tiles_total = $needed.Count
+                    tile        = $tile
+                    status      = 'fail'
+                    reason      = "sdf_hd_to_std exit $LASTEXITCODE"
+                }
+            }
+        }
+        & $EmitEvent @{
+            stage         = 'downsample_done'
+            tiles_made    = $stdOk
+            tiles_failed  = $stdFail
+        }
+    }
+
+    $sw.Stop()
+    & $EmitEvent @{
+        stage       = 'done'
+        elapsed_sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        hd_ok       = $hdOk
+        hd_skipped  = $hdSkip
+        hd_failed   = $hdFail
+        std_ok      = $stdOk
+        std_failed  = $stdFail
+        mode        = $mode
+    }
+}
+
 function Build-CacheReport {
     # Phase 15: walk the HD and STD tile dirs and return a per-tile summary
     # the viewer renders as a colored overlay (one rectangle per cached
@@ -903,6 +1061,42 @@ try {
                     } catch { Write-Host "  ERROR (post-stream): $($_.Exception.Message)" -ForegroundColor Red }
                 }
 
+            } elseif ($req.HttpMethod -eq 'POST' -and $req.Url.LocalPath -eq '/cache/precache') {
+                # ---- /cache/precache -- bulk fetch + downsample (Phase 16b)
+                # Same NDJSON-streaming pattern as /compute. The browser POSTs
+                # a region descriptor (preset, bbox, or "current map view") and
+                # a mode (hd / std / both); we resolve to an integer-tile list,
+                # fetch any missing HD tiles in parallel via the existing
+                # Fetch-MissingTilesAsync, then optionally downsample each HD
+                # tile to STD using the bundled sdf_hd_to_std tool. Each tile
+                # completion is one NDJSON event so the browser can update its
+                # cache overlay live.
+                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+                Write-Host ("  [{0}] POST /cache/precache  {1}" -f (Get-Date -Format 'HH:mm:ss'),
+                            $body.Substring(0, [math]::Min(160, $body.Length))) -ForegroundColor Yellow
+                $res.ContentType = 'application/x-ndjson; charset=utf-8'
+                $res.SendChunked = $true
+                $emit = {
+                    param([hashtable]$Event)
+                    $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $res.OutputStream.Flush()
+                    if ($Event.stage -in @('fetch_done','downsample_done','done','error')) {
+                        $ts = Get-Date -Format 'HH:mm:ss'
+                        $col = if ($Event.stage -eq 'error') { 'Red' } elseif ($Event.stage -eq 'done') { 'Green' } else { 'DarkCyan' }
+                        Write-Host ("  [{0}] {1}" -f $ts, ($Event | ConvertTo-Json -Compress -Depth 4)) -ForegroundColor $col
+                    }
+                }
+                try {
+                    $reqObj = $body | ConvertFrom-Json
+                    Invoke-PrecacheStreaming -Req $reqObj -EmitEvent $emit
+                } catch {
+                    try { & $emit @{ stage='error'; error=$_.Exception.Message } } catch {}
+                }
+                continue
             } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -eq '/cache') {
                 # ---- /cache -- tile-coverage report (Phase 15) -----------
                 # Returns a JSON snapshot of which integer-degree tiles are

@@ -201,6 +201,31 @@
           <span style="width:10px;height:10px;background:#3498db;display:inline-block;border-radius:2px;opacity:0.55;"></span> HD only
         </span>
       </div>
+
+      <!-- Phase 16b: in-UI precache trigger. Lets the user kick off the same
+           work that utils\precache_srtm.ps1 + downsample_hd_to_std.ps1 do
+           from the CLI, without leaving the viewer. Each tile-completion
+           event from the server bumps a per-tile rectangle in the overlay
+           so the user can watch coverage fill in live. -->
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #333;">
+        <div style="font-size:11px;color:#aaa;margin-bottom:4px;">Build cache for region</div>
+        <div class="row" style="gap:4px;">
+          <select id="precacheRegion" style="flex:2;">
+            <option value="NE">Northeast US (140 tiles, ~6 GB)</option>
+            <option value="MidAtl">Mid-Atlantic (54 tiles, ~2 GB)</option>
+            <option value="CONUS">CONUS (~1450 tiles, ~60 GB)</option>
+            <option value="view">Current map view</option>
+          </select>
+          <select id="precacheMode" style="flex:1;">
+            <option value="both">HD + Draft</option>
+            <option value="hd">HD only</option>
+            <option value="std">Draft only</option>
+          </select>
+        </div>
+        <button id="precacheBtn" style="margin-top:4px;width:100%;font-size:12px;">Start precache</button>
+        <div id="precacheStatus" class="status" style="margin-top:4px;font-size:11px;line-height:1.4;display:none;"></div>
+        <div id="precacheProgress" class="splat-progress" style="margin-top:4px;display:none;"><div class="fill"></div></div>
+      </div>
     `;
     L.DomEvent.disableClickPropagation(div);
     L.DomEvent.disableScrollPropagation(div);
@@ -367,6 +392,160 @@
   fetchCacheReport()
     .then(renderCacheStats)
     .catch(e => { cacheStatsEl.textContent = 'Cache status unavailable: ' + e; });
+
+  // ---- Precache trigger (Phase 16b) ----
+  // Streams NDJSON from /cache/precache the same way /compute does. As each
+  // fetch_progress / downsample_progress event arrives we patch the in-memory
+  // tile state and re-draw just that tile's rectangle, so coverage fills in
+  // live without re-issuing a /cache GET for every tile.
+  const precacheBtn    = document.getElementById('precacheBtn');
+  const precacheRegion = document.getElementById('precacheRegion');
+  const precacheMode   = document.getElementById('precacheMode');
+  const precacheStatus = document.getElementById('precacheStatus');
+  const precacheProg   = document.getElementById('precacheProgress');
+  const precacheFill   = precacheProg.querySelector('.fill');
+
+  // Mirror of /cache report so we can update individual tiles without a refetch.
+  // Populated lazily by fetchCacheReport(); precache events upsert into it.
+  let cacheState = null;
+  function ensureCacheStateLoaded() {
+    if (cacheState) return Promise.resolve(cacheState);
+    return fetchCacheReport().then(r => { cacheState = r; return r; });
+  }
+  function upsertTile(lat, west, opts) {
+    if (!cacheState) return;
+    const key = lat + ',' + west;
+    let t = cacheState.tiles.find(x => x.lat === lat && x.west === west);
+    if (!t) {
+      t = { lat, west, hd:false, std:false, hd_bytes:0, std_bytes:0 };
+      cacheState.tiles.push(t);
+    }
+    if (opts.hd  !== undefined) t.hd  = opts.hd;
+    if (opts.std !== undefined) t.std = opts.std;
+    // Re-render just this tile in the overlay if it's visible.
+    if (map.hasLayer(cacheLayer)) {
+      // Find and remove any existing rectangle for this tile, then add fresh.
+      cacheLayer.eachLayer(L => {
+        const b = L.getBounds();
+        const s = b.getSouth(), w = -b.getEast();   // recover (lat, west)
+        if (Math.round(s) === lat && Math.round(w) === west) cacheLayer.removeLayer(L);
+      });
+      const color = tileColor(t);
+      if (color) {
+        const bounds = [[lat, -west], [lat + 1, -(west - 1)]];
+        L.rectangle(bounds, {
+          color, weight:0.5, opacity:0.6, fillColor:color, fillOpacity:0.18, interactive:true
+        }).addTo(cacheLayer);
+      }
+    }
+  }
+  function buildPrecacheBody() {
+    const region = precacheRegion.value;
+    const mode   = precacheMode.value;
+    if (region === 'view') {
+      // Current map view -> integer-tile bounds covering it. Round outward
+      // so the user's whole visible area is covered (one tile of buffer is
+      // implicit because Math.floor / Math.ceil of an integer is itself).
+      const b = map.getBounds();
+      const minLat  = Math.floor(b.getSouth());
+      const maxLat  = Math.ceil(b.getNorth()) - 1;   // inclusive of the SW corner
+      // splat west convention is positive-west: lon -75 -> west=75
+      const minWest = Math.floor(-b.getEast()) + 1;
+      const maxWest = Math.ceil(-b.getWest());
+      if (maxLat < minLat || maxWest < minWest) {
+        return { error: 'Map view is too narrow; zoom out or pan to a real area.' };
+      }
+      return { mode, minLat, maxLat, minWest, maxWest };
+    }
+    return { mode, region };
+  }
+  precacheBtn.addEventListener('click', async () => {
+    const body = buildPrecacheBody();
+    if (body.error) {
+      precacheStatus.style.display = 'block';
+      precacheStatus.textContent = body.error;
+      return;
+    }
+    await ensureCacheStateLoaded();
+    precacheBtn.disabled = true;
+    precacheStatus.style.display = 'block';
+    precacheProg.style.display = 'block';
+    precacheFill.style.width = '0%';
+    precacheStatus.textContent = 'Starting…';
+    const t0 = performance.now();
+    let fetchDone = 0, fetchTotal = 0, dsDone = 0, dsTotal = 0;
+    try {
+      const r = await fetch('/cache/precache', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+      const reader = r.body.getReader();
+      const dec    = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          // Patch the overlay and update the progress text.
+          if (ev.stage === 'setup') {
+            precacheStatus.textContent = ev.message;
+          } else if (ev.stage === 'fetch_start') {
+            fetchTotal = ev.tiles_to_fetch || 0;
+            precacheStatus.textContent = `HD fetch: 0 / ${fetchTotal} (${ev.tiles_cached} already cached)`;
+          } else if (ev.stage === 'fetch_progress') {
+            fetchDone = ev.tiles_done;
+            if (ev.status === 'ok') {
+              // Parse tile name "N40W074" -> (lat, west)
+              const m = /^N(\d+)W(\d+)$/.exec(ev.tile);
+              if (m) upsertTile(+m[1], +m[2], { hd:true });
+            }
+            const pct = fetchTotal ? (fetchDone / fetchTotal) * 50 : 0;
+            precacheFill.style.width = pct.toFixed(1) + '%';
+            precacheStatus.textContent = `HD fetch: ${fetchDone} / ${fetchTotal} (${ev.tile} ${ev.status})`;
+          } else if (ev.stage === 'fetch_done') {
+            precacheStatus.textContent = `HD done: ${ev.tiles_fetched} fetched, ${ev.tiles_skipped} skip, ${ev.tiles_failed} fail`;
+          } else if (ev.stage === 'downsample_start') {
+            dsTotal = ev.tiles_to_make;
+            precacheStatus.textContent = `Draft downsample: 0 / ${dsTotal}`;
+          } else if (ev.stage === 'downsample_progress') {
+            dsDone = ev.tiles_done;
+            if (ev.status === 'ok') {
+              const m = /^N(\d+)W(\d+)$/.exec(ev.tile);
+              if (m) upsertTile(+m[1], +m[2], { std:true });
+            }
+            const pct = 50 + (dsTotal ? (dsDone / dsTotal) * 50 : 50);
+            precacheFill.style.width = pct.toFixed(1) + '%';
+            precacheStatus.textContent = `Draft: ${dsDone} / ${dsTotal} (${ev.tile} ${ev.status})`;
+          } else if (ev.stage === 'downsample_done') {
+            // pass
+          } else if (ev.stage === 'done') {
+            const sec = ((performance.now() - t0) / 1000).toFixed(0);
+            precacheFill.style.width = '100%';
+            precacheStatus.textContent =
+              `Done in ${sec}s · HD +${ev.hd_ok} (${ev.hd_skipped} skip, ${ev.hd_failed} fail) · Draft +${ev.std_ok}`;
+            // Refresh the headline stats display from server truth.
+            cacheLoadPromise = null;
+            fetchCacheReport().then(rep => { cacheState = rep; renderCacheStats(rep); });
+          } else if (ev.stage === 'error') {
+            throw new Error(ev.error);
+          }
+        }
+      }
+    } catch (e) {
+      precacheStatus.textContent = 'FAIL: ' + e.message;
+    } finally {
+      precacheBtn.disabled = false;
+      setTimeout(() => { precacheProg.style.display = 'none'; }, 2000);
+    }
+  });
 
   // ---------------- Compute ----------------
   async function loadOverlay(pngUrl, geoUrl) {
