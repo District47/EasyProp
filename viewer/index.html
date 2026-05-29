@@ -238,6 +238,68 @@
     background: #c00; width: 14px; height: 14px; border-radius: 50%;
     border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);
   }
+
+  /* Phase 19c.2: floating dBm legend in the map's bottom-right corner.
+     Always-visible by default; click the title bar to collapse to a thin
+     pill so it gets out of the way. State persists per session via
+     localStorage. The gradient stops match splat's built-in LoadDBMColors
+     palette exactly (see src/splat.cpp:3706+) so the colors on the legend
+     are the colors splat actually paints onto the overlay. */
+  .splat-legend {
+    background: rgba(20,20,20,0.94);
+    color: #ddd;
+    padding: 6px 9px;
+    border-radius: 5px;
+    font-family: ui-monospace, Consolas, monospace;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+    border: 1px solid #333;
+    user-select: none;
+  }
+  .splat-legend-head {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  .splat-legend-head:hover { color: #fff; }
+  .splat-legend-toggle { font-size: 10px; opacity: 0.7; }
+  .splat-legend.collapsed .splat-legend-body { display: none; }
+  .splat-legend.collapsed { padding: 5px 9px; }
+  .splat-legend-body {
+    display: flex; gap: 6px; margin-top: 6px;
+  }
+  .splat-legend-bar {
+    width: 14px; height: 160px; border-radius: 2px;
+    /* Stops are exactly splat's region.level[0..14]: 0 dBm down to -140 dBm,
+       in 10-dB steps, with the colors from LoadDBMColors. The 15th stop
+       (-150 dBm pale pink) is omitted -- it's essentially invisible. */
+    background: linear-gradient(to bottom,
+      rgb(255,0,0)     0%,    /* 0 dBm   */
+      rgb(255,128,0)   7.1%,  /* -10     */
+      rgb(255,165,0)  14.3%,  /* -20     */
+      rgb(255,206,0)  21.4%,  /* -30     */
+      rgb(255,255,0)  28.6%,  /* -40     */
+      rgb(184,255,0)  35.7%,  /* -50     */
+      rgb(0,255,0)    42.9%,  /* -60     */
+      rgb(0,208,0)    50%,    /* -70     */
+      rgb(0,196,196)  57.1%,  /* -80     */
+      rgb(0,148,255)  64.3%,  /* -90     */
+      rgb(80,80,255)  71.4%,  /* -100    */
+      rgb(0,38,255)   78.6%,  /* -110    */
+      rgb(142,63,255) 85.7%,  /* -120    */
+      rgb(196,54,255) 92.9%,  /* -130    */
+      rgb(255,0,255) 100%     /* -140    */
+    );
+  }
+  .splat-legend-labels {
+    display: flex; flex-direction: column;
+    justify-content: space-between;
+    font-size: 10px; line-height: 1;
+  }
+  .splat-legend-labels span { display: block; }
+  .splat-legend-quality {
+    font-size: 9px; color: #888; line-height: 1.35;
+    margin-top: 6px; max-width: 150px; border-top: 1px solid #2a2a2a; padding-top: 5px;
+  }
+  .splat-legend-quality b { color: #aaa; }
 </style>
 </head>
 <body>
@@ -311,6 +373,9 @@
         Every cached compute can be reopened instantly &mdash; no recompute. Click
         <b style="color:#80e090;">Open</b> on any card to load its overlay + settings,
         or tick <b>Show</b> to layer multiple in different colors for comparison.
+        Card color swatches just hue-rotate the whole overlay (so two visible
+        scenarios don't merge into one blob) &mdash; the dBm legend on the map
+        still reads the same in any color.
       </div>
 
       <div id="compCacheHeader" class="status">
@@ -391,6 +456,21 @@
         Computed PNGs &middot; %LOCALAPPDATA%\EasyProp\cache
       </div>
 
+      <h4>What the colors mean</h4>
+      <div class="status" style="font-size:10px;line-height:1.55;">
+        <b style="color:#ddd;">Coverage overlay (dBm)</b> &middot; red = strongest
+        signal, magenta = weakest. Always-visible legend in the map's
+        bottom-right corner.<br><br>
+        <b style="color:#ddd;">Scenario card swatches</b> &middot; hue-rotation of the
+        whole overlay. Lets you tell two visible scenarios apart on the same
+        map. The numbers don't change; only the palette shifts.<br><br>
+        <b style="color:#ddd;">Terrain tile rectangles</b> &middot;
+        <span style="color:#2ecc71;">green</span> = HD + Draft cached,
+        <span style="color:#f1c40f;">yellow</span> = Draft only,
+        <span style="color:#3498db;">blue</span> = HD only,
+        no rect = nothing cached.
+      </div>
+
       <h4>Links</h4>
       <div style="font-size:11px;line-height:1.7;">
         <a href="https://github.com/District47/EasyProp" target="_blank">GitHub project</a><br>
@@ -438,6 +518,49 @@
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19, attribution: '© OpenStreetMap'
   }).addTo(map);
+
+  // Phase 19c.2: floating dBm legend in the bottom-right corner of the map.
+  // The gradient matches splat-hd's built-in LoadDBMColors palette so the
+  // colors on the legend match what splat is actually painting. Collapsible;
+  // expanded/collapsed state persists across reloads.
+  const LEGEND_KEY = 'easyprop.legendCollapsed.v1';
+  const legendControl = L.control({ position: 'bottomright' });
+  legendControl.onAdd = function() {
+    const div = L.DomUtil.create('div', 'splat-legend');
+    const startCollapsed = (() => { try { return localStorage.getItem(LEGEND_KEY) === '1'; } catch { return false; } })();
+    if (startCollapsed) div.classList.add('collapsed');
+    div.innerHTML = `
+      <div class="splat-legend-head">
+        <span>Signal (dBm)</span>
+        <span class="splat-legend-toggle">${startCollapsed ? '▴' : '▾'}</span>
+      </div>
+      <div class="splat-legend-body">
+        <div class="splat-legend-bar"></div>
+        <div class="splat-legend-labels">
+          <span>0</span>   <span>−20</span> <span>−40</span> <span>−60</span>
+          <span>−80</span> <span>−100</span> <span>−120</span> <span>−140</span>
+        </div>
+      </div>
+      <div class="splat-legend-body splat-legend-quality">
+        <div>
+          <b>Above −70 dBm</b> &middot; clean voice / strong data<br>
+          <b>−70 to −90</b> &middot; marginal voice, OK digital<br>
+          <b>Below −90</b> &middot; near most receiver sensitivities
+        </div>
+      </div>
+    `;
+    const head = div.querySelector('.splat-legend-head');
+    head.addEventListener('click', () => {
+      div.classList.toggle('collapsed');
+      const collapsed = div.classList.contains('collapsed');
+      div.querySelector('.splat-legend-toggle').textContent = collapsed ? '▴' : '▾';
+      try { localStorage.setItem(LEGEND_KEY, collapsed ? '1' : '0'); } catch {}
+    });
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    return div;
+  };
+  legendControl.addTo(map);
 
   let txMarker = null;
   let placeMode = false;
