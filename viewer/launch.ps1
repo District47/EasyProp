@@ -291,7 +291,17 @@ function Invoke-PrecacheStreaming {
     #   downsample_done
     #   done
     #   error            -- anywhere, terminates the stream
-    param([pscustomobject]$Req, [scriptblock]$EmitEvent)
+    #
+    # Phase 17b cancellation: $CancelToken is a per-request pscustomobject
+    # the route handler updates from its emit-failure handler (HttpListener
+    # raises when the client TCP-closes the response). We check between
+    # tile operations and bail out cleanly with a 'cancelled' event.
+    param(
+        [pscustomobject]$Req,
+        [scriptblock]$EmitEvent,
+        [pscustomobject]$CancelToken = $null
+    )
+    function _IsCancelled { if ($CancelToken) { return $CancelToken.Cancelled } return $false }
 
     $box  = Resolve-PrecacheBbox -Req $Req
     $mode = if ($Req.mode) { "$($Req.mode)" } else { 'both' }
@@ -363,6 +373,7 @@ function Invoke-PrecacheStreaming {
         # regions becomes a UX pain.
         $done = 0
         foreach ($t in $needed) {
+            if (_IsCancelled) { break }
             $tile = 'N{0:D2}W{1:D3}' -f $t.Lat, $t.West
             & $sdfTool $t.Src $t.Dst 2>&1 | Out-Null
             $done++
@@ -395,8 +406,9 @@ function Invoke-PrecacheStreaming {
     }
 
     $sw.Stop()
+    $finalStage = if (_IsCancelled) { 'cancelled' } else { 'done' }
     & $EmitEvent @{
-        stage       = 'done'
+        stage       = $finalStage
         elapsed_sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
         hd_ok       = $hdOk
         hd_skipped  = $hdSkip
@@ -405,6 +417,71 @@ function Invoke-PrecacheStreaming {
         std_failed  = $stdFail
         mode        = $mode
     }
+}
+
+function Build-ComputeCacheReport {
+    # Phase 18: enumerate the compute cache (Phase 10's per-request png + geo
+    # + json sidecars under $CacheDir). Returns a list of entries the viewer
+    # can render in its cache-management panel.
+    #
+    # Each entry mirrors what Save-Cache wrote:
+    #   { key, cached_at, png_bytes, request: { lat, lon, freq_mhz, ... } }
+    # plus a couple of derived display fields (size_mb, draft bool).
+    param([string]$Dir)
+    if (-not (Test-Path $Dir)) {
+        return @{ entries=@(); count=0; total_mb=0; dir=$Dir }
+    }
+    $entries = @()
+    $total = 0L
+    foreach ($j in Get-ChildItem $Dir -Filter '*.json' -ErrorAction SilentlyContinue) {
+        $key = $j.BaseName
+        $png = Join-Path $Dir "$key.png"
+        if (-not (Test-Path $png)) { continue }   # orphan sidecar, skip
+        $meta = $null
+        try { $meta = Get-Content $j.FullName -Raw | ConvertFrom-Json } catch { continue }
+        $pngLen = (Get-Item $png).Length
+        $total += $pngLen
+        $entries += @{
+            key       = $key
+            cached_at = "$($meta.cached_at)"
+            png_bytes = $pngLen
+            png_mb    = [math]::Round($pngLen / 1MB, 2)
+            request   = $meta.request
+        }
+    }
+    # Sort newest-first so the most-recently-computed scenarios are easy to find.
+    $entries = @($entries | Sort-Object { $_.cached_at } -Descending)
+    return @{
+        entries  = $entries
+        count    = $entries.Count
+        total_mb = [math]::Round($total / 1MB, 2)
+        dir      = $Dir
+    }
+}
+
+function Remove-ComputeCacheEntry {
+    # Delete the .png + .geo + .json triplet for one cache key, or all
+    # three for every key if -All. Returns the count actually removed.
+    param([string]$Dir, [string]$Key = $null, [switch]$All)
+    if (-not (Test-Path $Dir)) { return 0 }
+    if ($All) {
+        $removed = 0
+        foreach ($f in Get-ChildItem $Dir -File -ErrorAction SilentlyContinue) {
+            try { Remove-Item $f.FullName -Force; $removed++ } catch {}
+        }
+        return $removed
+    }
+    if ([string]::IsNullOrWhiteSpace($Key)) { return 0 }
+    # Defensive: reject anything that's not a plausible cache key.
+    if ($Key -notmatch '^[a-fA-F0-9]+$') { return 0 }
+    $removed = 0
+    foreach ($ext in 'png','geo','json') {
+        $p = Join-Path $Dir "$Key.$ext"
+        if (Test-Path $p) {
+            try { Remove-Item $p -Force; $removed++ } catch {}
+        }
+    }
+    return $removed
 }
 
 function Build-CacheReport {
@@ -788,8 +865,13 @@ function Invoke-SplatComputeStreaming {
     #   5. splat_start  -- splat-hd launched
     #   6. splat_progress (every ~1 sec while compute is running)
     #   7. done         -- png + geo ready for the browser to overlay
-    #   8. error        -- on failure at any stage (terminates the stream)
-    param([pscustomobject]$Req, [scriptblock]$EmitEvent)
+    #   8. cancelled    -- caller (browser) closed the connection mid-run
+    #   9. error        -- on failure at any stage (terminates the stream)
+    param(
+        [pscustomobject]$Req,
+        [scriptblock]$EmitEvent,
+        [pscustomobject]$CancelToken = $null
+    )
 
     # -------- Cache check (first thing) -----------------------------------
     # Skip fetch + splat entirely for an identical previous request.
@@ -930,6 +1012,16 @@ function Invoke-SplatComputeStreaming {
     $lastPhase = ''
     while (-not $proc.HasExited) {
         Start-Sleep -Milliseconds 1000
+        # Phase 17b: if the browser cancelled (HttpListener emit started
+        # failing -> CancelToken flipped), terminate the splat-hd child
+        # process and bail out. The next poll iteration won't run because
+        # the loop condition will see HasExited.
+        if ($CancelToken -and $CancelToken.Cancelled) {
+            try { $proc.Kill() } catch {}
+            & $EmitEvent @{ stage='cancelled'; message='compute cancelled by client' }
+            $proc.WaitForExit()
+            return
+        }
         try {
             $text = [System.IO.File]::ReadAllText($stdout)
         } catch { $text = '' }
@@ -1035,24 +1127,41 @@ try {
 
                 # Closure-captures $res so the streaming compute can flush
                 # one JSON line per event as it works.
+                # Phase 17b: the cancel token is flipped by the emit lambda
+                # when a write to the (now-closed) client socket throws.
+                # Invoke-SplatComputeStreaming polls it between splat-progress
+                # samples and kills the splat-hd child process when set.
+                $cancelToken = [pscustomobject]@{ Cancelled = $false }
                 $emit = {
                     param([hashtable]$Event)
-                    $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
-                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
-                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
-                    $res.OutputStream.Flush()
+                    if ($cancelToken.Cancelled) { return }
+                    try {
+                        $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+                        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                        $res.OutputStream.Flush()
+                    } catch {
+                        $cancelToken.Cancelled = $true
+                        Write-Host "  [compute] client disconnected -- cancelling" -ForegroundColor Yellow
+                        return
+                    }
                     # Mirror key events to the server console so the operator
                     # can follow along too.
-                    if ($Event.stage -in @('fetch_done','splat_start','done','error')) {
+                    if ($Event.stage -in @('fetch_done','splat_start','done','cancelled','error')) {
                         $ts = Get-Date -Format 'HH:mm:ss'
-                        $col = if ($Event.stage -eq 'error') { 'Red' } elseif ($Event.stage -eq 'done') { 'Green' } else { 'DarkCyan' }
+                        $col = switch ($Event.stage) {
+                            'error'     { 'Red' }
+                            'cancelled' { 'Yellow' }
+                            'done'      { 'Green' }
+                            default     { 'DarkCyan' }
+                        }
                         Write-Host ("  [{0}] {1}" -f $ts, ($Event | ConvertTo-Json -Compress -Depth 6)) -ForegroundColor $col
                     }
                 }
 
                 try {
                     $reqObj = $body | ConvertFrom-Json
-                    Invoke-SplatComputeStreaming -Req $reqObj -EmitEvent $emit
+                    Invoke-SplatComputeStreaming -Req $reqObj -EmitEvent $emit -CancelToken $cancelToken
                 } catch {
                     # Best-effort: tell the browser even if the failure was
                     # before/during the stream.
@@ -1071,6 +1180,12 @@ try {
                 # tile to STD using the bundled sdf_hd_to_std tool. Each tile
                 # completion is one NDJSON event so the browser can update its
                 # cache overlay live.
+                #
+                # Phase 17b cancellation: when the browser aborts its fetch()
+                # (Cancel button), the next OutputStream.Write here throws.
+                # We catch it, flip $cancelToken.Cancelled, and downstream
+                # code (Invoke-PrecacheStreaming's per-tile loop) checks the
+                # token and exits cleanly with a 'cancelled' final event.
                 $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
                 $body = $reader.ReadToEnd()
                 $reader.Close()
@@ -1078,24 +1193,70 @@ try {
                             $body.Substring(0, [math]::Min(160, $body.Length))) -ForegroundColor Yellow
                 $res.ContentType = 'application/x-ndjson; charset=utf-8'
                 $res.SendChunked = $true
+                $cancelToken = [pscustomobject]@{ Cancelled = $false }
                 $emit = {
                     param([hashtable]$Event)
-                    $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
-                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
-                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
-                    $res.OutputStream.Flush()
-                    if ($Event.stage -in @('fetch_done','downsample_done','done','error')) {
+                    if ($cancelToken.Cancelled) { return }
+                    try {
+                        $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+                        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                        $res.OutputStream.Flush()
+                    } catch {
+                        # Client TCP-closed (browser cancel or page navigation)
+                        $cancelToken.Cancelled = $true
+                        Write-Host "  [precache] client disconnected -- cancelling" -ForegroundColor Yellow
+                        return
+                    }
+                    if ($Event.stage -in @('fetch_done','downsample_done','done','cancelled','error')) {
                         $ts = Get-Date -Format 'HH:mm:ss'
-                        $col = if ($Event.stage -eq 'error') { 'Red' } elseif ($Event.stage -eq 'done') { 'Green' } else { 'DarkCyan' }
+                        $col = switch ($Event.stage) {
+                            'error'     { 'Red' }
+                            'cancelled' { 'Yellow' }
+                            'done'      { 'Green' }
+                            default     { 'DarkCyan' }
+                        }
                         Write-Host ("  [{0}] {1}" -f $ts, ($Event | ConvertTo-Json -Compress -Depth 4)) -ForegroundColor $col
                     }
                 }
                 try {
                     $reqObj = $body | ConvertFrom-Json
-                    Invoke-PrecacheStreaming -Req $reqObj -EmitEvent $emit
+                    Invoke-PrecacheStreaming -Req $reqObj -EmitEvent $emit -CancelToken $cancelToken
                 } catch {
                     try { & $emit @{ stage='error'; error=$_.Exception.Message } } catch {}
                 }
+                continue
+            } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -eq '/cache/compute') {
+                # ---- /cache/compute -- list compute-cache entries (Phase 18)
+                $rep = Build-ComputeCacheReport -Dir $CacheDir
+                $json = $rep | ConvertTo-Json -Depth 6 -Compress
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                $res.Close(); continue
+            } elseif ($req.HttpMethod -eq 'DELETE' -and $req.Url.LocalPath -eq '/cache/compute') {
+                # ---- DELETE /cache/compute -- wipe all entries (Phase 18)
+                $removed = Remove-ComputeCacheEntry -Dir $CacheDir -All
+                $json = (@{ removed = $removed } | ConvertTo-Json -Compress)
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                $res.Close()
+                Write-Host "  [{0}] DELETE /cache/compute (all) -> $removed files" -f (Get-Date -Format 'HH:mm:ss')
+                continue
+            } elseif ($req.HttpMethod -eq 'DELETE' -and $req.Url.LocalPath -match '^/cache/compute/([a-fA-F0-9]+)$') {
+                # ---- DELETE /cache/compute/<key> -- wipe one entry (Phase 18)
+                $key = $Matches[1]
+                $removed = Remove-ComputeCacheEntry -Dir $CacheDir -Key $key
+                $json = (@{ key=$key; removed=$removed } | ConvertTo-Json -Compress)
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                $res.Close()
+                Write-Host ("  [{0}] DELETE /cache/compute/{1} -> {2} files" -f (Get-Date -Format 'HH:mm:ss'), $key, $removed)
                 continue
             } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -eq '/cache') {
                 # ---- /cache -- tile-coverage report (Phase 15) -----------

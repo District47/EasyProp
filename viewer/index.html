@@ -49,6 +49,33 @@
   .splat-panel .row { display: flex; gap: 6px; }
   .splat-panel .row > label { flex: 1; }
 
+  /* Phase 17c: toast notifications -- map-corner overlay for transient
+     errors / info. Stacks bottom-up so the most recent toast is on top.
+     Click anywhere on a toast to dismiss; auto-dismiss after 6 s for
+     info / 12 s for errors (long enough to actually read a stack trace
+     before it disappears). */
+  .splat-toast-stack {
+    position: absolute; bottom: 18px; right: 18px; z-index: 1000;
+    display: flex; flex-direction: column-reverse; gap: 8px;
+    max-width: 360px; pointer-events: none;
+  }
+  .splat-toast {
+    background: #2b2b2b; color: #fafafa; padding: 10px 12px;
+    border-radius: 4px; font-size: 12px; line-height: 1.4;
+    font-family: ui-monospace, Consolas, monospace;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35); cursor: pointer;
+    pointer-events: auto; opacity: 0; transform: translateY(8px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    border-left: 3px solid #888;
+    word-break: break-word;
+  }
+  .splat-toast.shown { opacity: 1; transform: translateY(0); }
+  .splat-toast.info  { border-left-color: #4aa3ff; }
+  .splat-toast.error { border-left-color: #ff5555; }
+  .splat-toast.warn  { border-left-color: #ffb700; }
+  .splat-toast .splat-toast-title { font-weight: 600; margin-bottom: 2px; }
+  .splat-toast .splat-toast-hint  { font-size: 10px; opacity: 0.6; margin-top: 4px; }
+
   /* Progress bar -- shown only while a compute is in flight */
   .splat-progress {
     display: none;
@@ -170,7 +197,10 @@
         Draft mode (faster, lower resolution)
       </label>
 
-      <button id="compute" class="primary" disabled>Compute coverage</button>
+      <div class="row">
+        <button id="compute" class="primary" disabled style="flex:2;">Compute coverage</button>
+        <button id="computeCancel" style="flex:1;display:none;">Cancel</button>
+      </div>
       <div id="status" class="status">Place a transmitter to begin.</div>
       <div id="progress" class="splat-progress"><div class="fill"></div></div>
       <div id="stage" class="splat-stage"></div>
@@ -202,6 +232,20 @@
         </span>
       </div>
 
+      <!-- Phase 18: previously-computed scenarios. Lists the cached PNGs
+           Phase 10 saves (key, TX coords, band/power, draft flag). Click
+           Load to restore the form state + place the TX; the next Compute
+           click will hit the cache so the round-trip is ~0.1 s. -->
+      <h4>Computed scenarios</h4>
+      <div id="compCacheHeader" class="status" style="font-size:11px;line-height:1.4;">
+        <span style="opacity:0.7;">Loading&hellip;</span>
+      </div>
+      <div id="compCacheList" style="font-size:11px;max-height:160px;overflow-y:auto;border:1px solid #333;border-radius:3px;margin-top:4px;display:none;"></div>
+      <div class="row" style="margin-top:4px;">
+        <button id="compCacheRefresh" style="flex:1;font-size:11px;">Refresh</button>
+        <button id="compCacheClearAll" style="flex:1;font-size:11px;">Clear all</button>
+      </div>
+
       <!-- Phase 16b: in-UI precache trigger. Lets the user kick off the same
            work that utils\precache_srtm.ps1 + downsample_hd_to_std.ps1 do
            from the CLI, without leaving the viewer. Each tile-completion
@@ -222,7 +266,10 @@
             <option value="std">Draft only</option>
           </select>
         </div>
-        <button id="precacheBtn" style="margin-top:4px;width:100%;font-size:12px;">Start precache</button>
+        <div class="row" style="margin-top:4px;">
+          <button id="precacheBtn"       style="flex:2;font-size:12px;">Start precache</button>
+          <button id="precacheCancelBtn" style="flex:1;font-size:12px;display:none;">Cancel</button>
+        </div>
         <div id="precacheStatus" class="status" style="margin-top:4px;font-size:11px;line-height:1.4;display:none;"></div>
         <div id="precacheProgress" class="splat-progress" style="margin-top:4px;display:none;"><div class="fill"></div></div>
       </div>
@@ -262,16 +309,102 @@
     const p = bands[bandSel.value];
     if (p.freq  !== null) freqInp.value  = p.freq;
     if (p.watts !== null) wattsInp.value = p.watts;
+    saveSettings();
   });
   antSel.addEventListener('change', () => {
     const p = antennas[antSel.value];
     if (p.gain !== null) gainInp.value = p.gain;
+    saveSettings();
   });
+
+  // ---------------- Settings persistence (Phase 17a) ----------------
+  // Persist form state across page reloads / launcher restarts via
+  // localStorage. The intent is "remember what I was doing last time" --
+  // band, antenna, power, range, draft toggle, overlay opacity, etc.
+  // Map state (zoom / center) and which TX is placed are intentionally NOT
+  // persisted; placing a TX is the user's explicit "start here" action.
+  const SETTINGS_KEY = 'easyprop.settings.v1';
+  const PERSISTED = [
+    ['band','value'], ['freq','value'], ['watts','value'],
+    ['ant','value'],  ['gain','value'], ['height','value'],
+    ['range','value'], ['draft','checked'],
+    ['op','value'],   ['showCache','checked'],
+    ['precacheRegion','value'], ['precacheMode','value'],
+  ];
+  function saveSettings() {
+    const out = {};
+    for (const [id, prop] of PERSISTED) {
+      const el = document.getElementById(id);
+      if (el != null) out[id] = el[prop];
+    }
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+    catch (e) { /* private mode or quota full -- silently swallow */ }
+  }
+  function restoreSettings() {
+    let saved;
+    try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+    catch (e) { return; }
+    if (!saved) return;
+    for (const [id, prop] of PERSISTED) {
+      const el = document.getElementById(id);
+      if (el != null && saved[id] !== undefined) el[prop] = saved[id];
+    }
+  }
+  restoreSettings();
+  // Save on any change to any persisted control. Single delegated listener
+  // keeps it tidy; the band/antenna `change` handlers above also call
+  // saveSettings() so the cascaded freq/watts/gain updates get captured.
+  for (const [id, _] of PERSISTED) {
+    const el = document.getElementById(id);
+    if (el == null) continue;
+    const ev = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
+    el.addEventListener(ev, saveSettings);
+  }
 
   function setStatus(msg, cls='') {
     statusEl.textContent = msg;
     statusEl.className   = 'status ' + cls;
   }
+
+  // ---------------- Toast notifications (Phase 17c) ----------------
+  // Replaces the older "raw exception text in the status box" pattern for
+  // anything the user might actually need to react to (SRTM mirror down,
+  // cache directory not writable, splat-hd not found). The status line
+  // still shows transient working state; toasts are for things you want
+  // to see after the status has moved on.
+  const toastStack = document.createElement('div');
+  toastStack.className = 'splat-toast-stack';
+  map.getContainer().parentElement.appendChild(toastStack);
+
+  function toast(message, opts = {}) {
+    const { title = null, kind = 'info', durationMs = null, hint = null } = opts;
+    const t = document.createElement('div');
+    t.className = 'splat-toast ' + (kind || 'info');
+    if (title) {
+      const h = document.createElement('div');
+      h.className = 'splat-toast-title'; h.textContent = title;
+      t.appendChild(h);
+    }
+    t.appendChild(document.createTextNode(message));
+    if (hint) {
+      const sub = document.createElement('div');
+      sub.className = 'splat-toast-hint'; sub.textContent = hint;
+      t.appendChild(sub);
+    }
+    toastStack.appendChild(t);
+    // Trigger fade-in next frame
+    requestAnimationFrame(() => t.classList.add('shown'));
+    const dismiss = () => {
+      t.classList.remove('shown');
+      setTimeout(() => t.remove(), 250);
+    };
+    t.addEventListener('click', dismiss);
+    const ms = durationMs ?? (kind === 'error' ? 12000 : 6000);
+    setTimeout(dismiss, ms);
+    return dismiss;
+  }
+  // Bind to window so other modules / one-liners can call it.
+  window.toast = toast;
 
   // ---------------- TX placement ----------------
   function setTx(lat, lon) {
@@ -393,6 +526,117 @@
     .then(renderCacheStats)
     .catch(e => { cacheStatsEl.textContent = 'Cache status unavailable: ' + e; });
 
+  // ---------------- Compute-cache management (Phase 18) ----------------
+  // Lists cache entries the Phase-10 deterministic compute cache wrote (one
+  // .png + .geo + .json triplet per request). The .json sidecar holds the
+  // original request, so "Load" can deterministically restore exactly what
+  // would have been re-computed.
+  const compCacheHeader   = document.getElementById('compCacheHeader');
+  const compCacheList     = document.getElementById('compCacheList');
+  const compCacheRefresh  = document.getElementById('compCacheRefresh');
+  const compCacheClearAll = document.getElementById('compCacheClearAll');
+
+  function fmtCacheTs(iso) {
+    // ISO with timezone -> "5/29 18:42"
+    const d = new Date(iso);
+    if (isNaN(d)) return iso || '';
+    const mm = d.getMonth() + 1, dd = d.getDate();
+    const HH = String(d.getHours()).padStart(2, '0');
+    const MM = String(d.getMinutes()).padStart(2, '0');
+    return `${mm}/${dd} ${HH}:${MM}`;
+  }
+  function renderCompCacheList(report) {
+    compCacheHeader.innerHTML =
+      `${report.count} scenario${report.count === 1 ? '' : 's'} cached, ` +
+      `${report.total_mb} MB on disk`;
+    compCacheList.innerHTML = '';
+    if (report.count === 0) {
+      compCacheList.style.display = 'none';
+      return;
+    }
+    compCacheList.style.display = 'block';
+    for (const e of report.entries) {
+      const r = e.request || {};
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 6px;border-bottom:1px solid #2a2a2a;';
+      const label = document.createElement('div');
+      label.style.cssText = 'flex:1;line-height:1.35;';
+      const draftBadge = r.draft ? ' <span style="background:#f1c40f;color:#000;padding:0 4px;border-radius:2px;font-size:10px;">DFT</span>' : '';
+      label.innerHTML =
+        `<div>${fmtCacheTs(e.cached_at)} &middot; ${r.lat?.toFixed(3)}, ${r.lon?.toFixed(3)}${draftBadge}</div>` +
+        `<div style="color:#999;font-size:10px;">${r.freq_mhz} MHz &middot; ${r.watts} W &middot; ${r.gain_dbi} dBi &middot; ${r.antenna_height_m} m &middot; ${r.range_mi} mi &middot; ${e.png_mb} MB</div>`;
+      const loadBtn = document.createElement('button');
+      loadBtn.textContent = 'Load';
+      loadBtn.style.cssText = 'font-size:10px;padding:2px 6px;';
+      loadBtn.addEventListener('click', () => loadCachedScenario(e));
+      const delBtn  = document.createElement('button');
+      delBtn.textContent = '×';
+      delBtn.title = 'Delete this cached scenario';
+      delBtn.style.cssText = 'font-size:12px;padding:2px 8px;color:#c44;';
+      delBtn.addEventListener('click', () => deleteCachedScenario(e.key));
+      row.appendChild(label);
+      row.appendChild(loadBtn);
+      row.appendChild(delBtn);
+      compCacheList.appendChild(row);
+    }
+  }
+  function loadCachedScenario(entry) {
+    const r = entry.request || {};
+    // Restore form fields
+    if (r.freq_mhz       !== undefined) freqInp.value   = r.freq_mhz;
+    if (r.watts          !== undefined) wattsInp.value  = r.watts;
+    if (r.gain_dbi       !== undefined) gainInp.value   = r.gain_dbi;
+    if (r.antenna_height_m !== undefined) heightInp.value = r.antenna_height_m;
+    if (r.range_mi       !== undefined) rangeInp.value  = r.range_mi;
+    if (r.draft          !== undefined) document.getElementById('draft').checked = r.draft;
+    saveSettings();
+    // Place the TX (also pans the map appropriately via existing setTx logic)
+    if (r.lat !== undefined && r.lon !== undefined) {
+      setTx(r.lat, r.lon);
+      map.setView([r.lat, r.lon], Math.max(map.getZoom(), 9));
+    }
+    toast('Settings restored. Click "Compute coverage" to fetch from cache.', {
+      kind: 'info', title: 'Scenario loaded'
+    });
+  }
+  async function deleteCachedScenario(key) {
+    try {
+      const r = await fetch('/cache/compute/' + encodeURIComponent(key), { method: 'DELETE' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const out = await r.json();
+      toast(`Removed ${out.removed} file${out.removed === 1 ? '' : 's'}.`,
+            { kind: 'info', title: 'Deleted', durationMs: 3000 });
+      refreshCompCache();
+    } catch (e) {
+      toast(e.message, { kind: 'error', title: 'Delete failed' });
+    }
+  }
+  async function refreshCompCache() {
+    try {
+      const r = await fetch('/cache/compute');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const rep = await r.json();
+      renderCompCacheList(rep);
+    } catch (e) {
+      compCacheHeader.textContent = 'Compute cache unavailable: ' + e.message;
+    }
+  }
+  compCacheRefresh.addEventListener('click', refreshCompCache);
+  compCacheClearAll.addEventListener('click', async () => {
+    if (!confirm('Wipe ALL cached compute scenarios?\n\nThis deletes every cached PNG/geo/sidecar from %LOCALAPPDATA%\\EasyProp\\cache\\. Settings tiles (terrain) are not touched.')) return;
+    try {
+      const r = await fetch('/cache/compute', { method: 'DELETE' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const out = await r.json();
+      toast(`Cleared. ${out.removed} files deleted.`, { kind: 'info', title: 'Cache cleared' });
+      refreshCompCache();
+    } catch (e) {
+      toast(e.message, { kind: 'error', title: 'Clear failed' });
+    }
+  });
+  // Initial load
+  refreshCompCache();
+
   // ---- Precache trigger (Phase 16b) ----
   // Streams NDJSON from /cache/precache the same way /compute does. As each
   // fetch_progress / downsample_progress event arrives we patch the in-memory
@@ -459,6 +703,19 @@
     }
     return { mode, region };
   }
+  // Phase 17b: cancel = client AbortController + server detect-disconnect.
+  // While the fetch is in flight we expose precacheCancelBtn; clicking it
+  // calls controller.abort(), which closes the response stream. The
+  // server's next OutputStream.Write throws -> cancel token flips ->
+  // Invoke-PrecacheStreaming exits cleanly with a `cancelled` event.
+  // (The browser doesn't actually see that event because the stream is
+  // already torn down, but the server logs it and any partially-cached
+  // tiles do stay cached.)
+  let precacheAbort = null;
+  const precacheCancelBtn = document.getElementById('precacheCancelBtn');
+  precacheCancelBtn.addEventListener('click', () => {
+    if (precacheAbort) precacheAbort.abort();
+  });
   precacheBtn.addEventListener('click', async () => {
     const body = buildPrecacheBody();
     if (body.error) {
@@ -468,17 +725,20 @@
     }
     await ensureCacheStateLoaded();
     precacheBtn.disabled = true;
+    precacheCancelBtn.style.display = '';
     precacheStatus.style.display = 'block';
     precacheProg.style.display = 'block';
     precacheFill.style.width = '0%';
     precacheStatus.textContent = 'Starting…';
     const t0 = performance.now();
     let fetchDone = 0, fetchTotal = 0, dsDone = 0, dsTotal = 0;
+    precacheAbort = new AbortController();
     try {
       const r = await fetch('/cache/precache', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: precacheAbort.signal
       });
       if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
       const reader = r.body.getReader();
@@ -540,9 +800,21 @@
         }
       }
     } catch (e) {
-      precacheStatus.textContent = 'FAIL: ' + e.message;
+      if (e.name === 'AbortError') {
+        precacheStatus.textContent = 'Precache cancelled. Tiles already finished stay cached.';
+        toast('Precache cancelled.', { title: 'Cancelled', kind: 'warn' });
+        // Refresh cache state -- some tiles likely landed before cancel.
+        cacheLoadPromise = null;
+        fetchCacheReport().then(rep => { cacheState = rep; renderCacheStats(rep); });
+      } else {
+        precacheStatus.textContent = 'Precache failed';
+        toast(e.message, { title: 'Precache failed', kind: 'error',
+                            hint: 'Some tiles may have been cached before the failure.' });
+      }
     } finally {
       precacheBtn.disabled = false;
+      precacheCancelBtn.style.display = 'none';
+      precacheAbort = null;
       setTimeout(() => { precacheProg.style.display = 'none'; }, 2000);
     }
   });
@@ -668,6 +940,14 @@
     return null;
   }
 
+  // Phase 17b: compute cancel mirrors the precache pattern. AbortController
+  // tears down the response stream; the server detects via OutputStream
+  // failure and kills the splat-hd child process.
+  let computeAbort = null;
+  const computeCancelBtn = document.getElementById('computeCancel');
+  computeCancelBtn.addEventListener('click', () => {
+    if (computeAbort) computeAbort.abort();
+  });
   compBtn.addEventListener('click', async () => {
     if (txLat === null) return;
     const req = {
@@ -683,6 +963,7 @@
       draft: document.getElementById('draft').checked
     };
     compBtn.disabled = true;
+    computeCancelBtn.style.display = '';
     const t0 = performance.now();
     setStatus('Computing coverage…', 'busy');
     showProgress(true);
@@ -692,11 +973,13 @@
     startElapsedTimer(t0);
 
     let terminal = null;
+    computeAbort = new AbortController();
     try {
       const r = await fetch('/compute', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(req)
+        body: JSON.stringify(req),
+        signal: computeAbort.signal
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
 
@@ -751,12 +1034,24 @@
             fetchCacheReport().then(renderCacheStats);
           }
         }
+        // Phase 18: a fresh compute lands one new entry in the compute cache.
+        refreshCompCache();
       }
     } catch (e) {
-      setStatus('FAIL: ' + e.message, 'err');
-      setStage('failed');
+      if (e.name === 'AbortError') {
+        setStatus('Cancelled.', 'err');
+        setStage('cancelled');
+        toast('Compute cancelled.', { title: 'Cancelled', kind: 'warn' });
+      } else {
+        setStatus('Compute failed', 'err');
+        setStage('failed');
+        toast(e.message, { title: 'Compute failed', kind: 'error',
+                            hint: 'See server console for stack trace.' });
+      }
     } finally {
       compBtn.disabled = false;
+      computeCancelBtn.style.display = 'none';
+      computeAbort = null;
       stopElapsedTimer();
       // Leave the progress bar visible briefly so the user sees the final 100%
       setTimeout(() => showProgress(false), 1500);
