@@ -1085,12 +1085,41 @@ function Invoke-SplatComputeStreaming {
 
 # --------------------- HTTP loop -------------------------------------------
 
-$listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://localhost:$Port/")
-try { $listener.Start() } catch {
-    Write-Host "FAIL: bind http://localhost:$Port/ -- $($_.Exception.Message)" -ForegroundColor Red
+# Try the requested port; if it's busy (most commonly a stale HTTP.sys
+# binding from a previous viewer that got X'd out instead of Ctrl+C'd),
+# walk forward to the next free port and tell the user. Avoids the
+# scary "Failed to listen on prefix [...] conflicts with an existing
+# registration" message users were hitting after a sloppy shutdown.
+$listener  = $null
+$portTried = $Port
+$lastErr   = $null
+for ($attempt = 0; $attempt -lt 20 -and -not $listener; $attempt++) {
+    $candidate = $Port + $attempt
+    $try = [System.Net.HttpListener]::new()
+    $try.Prefixes.Add("http://localhost:$candidate/")
+    try {
+        $try.Start()
+        $listener  = $try
+        $portTried = $candidate
+        if ($attempt -gt 0) {
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "  Port $Port was busy; bound on $candidate instead." -ForegroundColor Yellow
+            Write-Host "  (Most likely cause: a previous viewer process didn't" -ForegroundColor DarkYellow
+            Write-Host "   shut down cleanly. To free $Port, in an admin PowerShell run:" -ForegroundColor DarkYellow
+            Write-Host "      Stop-Service http -Force ; Start-Service http" -ForegroundColor DarkYellow
+            Write-Host "   Or pass -Port $candidate explicitly to skip the search next time.)" -ForegroundColor DarkYellow
+        }
+    } catch {
+        $lastErr = $_.Exception.Message
+        try { $try.Close() } catch {}
+    }
+}
+if (-not $listener) {
+    Write-Host "FAIL: tried $Port..$($Port + 19), all busy. Last error: $lastErr" -ForegroundColor Red
+    Write-Host "Reboot (or as admin: Stop-Service http -Force ; Start-Service http) clears stuck HTTP.sys bindings." -ForegroundColor Yellow
     exit 2
 }
+$Port = $portTried
 
 $url = "http://localhost:$Port/?name=$BaseName"
 Write-Host ""
