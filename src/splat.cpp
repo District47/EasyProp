@@ -128,7 +128,17 @@ char 	string[255], sdf_path[255], opened=0, gpsav=0, splat_name[10],
 	splat_version[6], dashes[80], olditm;
 
 double	earthradius, max_range=0.0, forced_erp=-1.0, dpp, ppd,
-	fzone_clearance=0.6, forced_freq, clutter;
+	fzone_clearance=0.6, forced_freq, clutter,
+	user_bbox_deg=0.0;	/* Phase 13: optional explicit bbox half-width
+				   (degrees) overriding the deg_range = max_range/57
+				   derivation. Set via -bbox CLI flag; 0 means
+				   "fall through to the legacy max_range-driven
+				   sizing". Lets the viewer shrink splat's analysis
+				   box independently of the coverage-radius cutoff
+				   (-R), which is what makes a 30-mi click in NJ
+				   run in 1-2 lat tiles instead of being forced to
+				   round up to 3 because the TX sits a third of a
+				   degree off the nearest integer boundary. */
 
 int	min_north=90, max_north=-90, min_west=360, max_west=-1, ippd, mpi,
 	max_elevation=-32768, min_elevation=32768, bzerror, contour_threshold;
@@ -7966,7 +7976,23 @@ int main(int argc, char *argv[])
 
 				if (max_range>1000.0)
 					max_range=1000.0;
-			}			 
+			}
+		}
+
+		if (strcmp(argv[x],"-bbox")==0)
+		{
+			/* Phase 13: explicit analysis-bbox half-width in DEGREES.
+			   Bypasses the deg_range = max_range/57 derivation, which
+			   in metric mode + a small range often rounds up an extra
+			   integer tile and balloons the compute area. Clamped to a
+			   sane range; 0 leaves legacy sizing in effect. */
+			z=x+1;
+			if (z<=y && argv[z][0] && argv[z][0]!='-')
+			{
+				sscanf(argv[z],"%lf",&user_bbox_deg);
+				if (user_bbox_deg<0.05) user_bbox_deg=0.0;
+				if (user_bbox_deg>5.0)  user_bbox_deg=5.0;
+			}
 		}
 
 		if (strcmp(argv[x],"-m")==0)
@@ -8509,6 +8535,13 @@ int main(int argc, char *argv[])
 				max_range=tx_range+rx_range;
 
 			deg_range=max_range/57.0;
+
+			/* Phase 13 override: explicit bbox half-width takes
+			   precedence over the max_range-derived deg_range,
+			   so the viewer can shrink the analysis area without
+			   shrinking the coverage-radius cutoff. */
+			if (user_bbox_deg>0.0)
+				deg_range=user_bbox_deg;
 
 			/* Prevent the demand for a really wide coverage
 			   from allocating more "pages" than are available

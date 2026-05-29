@@ -241,6 +241,29 @@ function Get-SdfName {
     '{0}_{1}_{2}_{3}-hd.sdf' -f $Lat, ($Lat+1), ($West-1), $West
 }
 
+function Get-EffectiveDegLimit {
+    # Phase 13: shrink splat's analysis bbox to ~just-cover the user's
+    # coverage radius (plus a small margin so the disc isn't clipped at
+    # the rendered image edge). splat picks its bbox from the loaded SDF
+    # pages, so feeding it a smaller tile set is how we make it compute
+    # less. Returns the half-width in degrees.
+    #
+    # The 0.25-deg floor (~28 km) keeps very small ranges from collapsing
+    # the bbox to a single tile (which under MAXPAGES=9 occasionally
+    # confuses splat's edge-walk; cheap insurance vs. virtually no extra
+    # compute at small ranges).
+    param(
+        [double]$RangeMi,
+        [double]$MarginKm,
+        [double]$HardCapDeg   # never exceed the launcher's -DegLimit
+    )
+    $rangeKm = $RangeMi * 1.609344
+    $eff = ($rangeKm + $MarginKm) / 111.0
+    if ($eff -lt 0.25)        { $eff = 0.25 }
+    if ($eff -gt $HardCapDeg) { $eff = $HardCapDeg }
+    return $eff
+}
+
 function Fetch-MissingTilesAsync {
     # Fetch each missing tile in parallel via Start-Job (one job per tile),
     # invoking the supplied $EmitEvent callback as tiles complete so the
@@ -443,7 +466,7 @@ function Parse-SplatProgress {
 # would invalidate previously-cached PNGs. Cached files from a different
 # schema simply won't be found by Get-CacheKey and the next run will
 # regenerate. Stale files are inert -- delete the cache dir to clean them up.
-$script:CACHE_SCHEMA = 'v1'
+$script:CACHE_SCHEMA = 'v2'   # v2: per-request tile-bbox tightening (Phase 13)
 
 function Get-CacheKey {
     # Canonicalize the request into a stable JSON document, then SHA-256 it.
@@ -538,8 +561,24 @@ function Invoke-SplatComputeStreaming {
         return
     }
 
-    & $EmitEvent @{ stage='setup'; message='Identifying required SRTM tiles'; cache_key=$key }
-    $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $DegLimit
+    # Phase 13: shrink splat's compute area to match the user's range,
+    # instead of always rendering the full deg_limit (1.0-deg) bbox. We pass
+    # the effective deg-limit to Get-RequiredTiles AND use it to stage a
+    # per-request scratch dir with only those tiles; splat picks its bbox
+    # from the SDF pages it finds.
+    # Margin: how much breathing room beyond the user's coverage radius the
+    # rendered image extends to. Smaller margin = tighter bbox = fewer SDF
+    # tiles loaded = faster splat (often dramatically so when the TX is near
+    # a tile boundary). 5 km keeps the coverage disc visibly inside the
+    # image edge without spilling into neighbor tiles for most TXs.
+    $effDeg = Get-EffectiveDegLimit -RangeMi $Req.range_mi -MarginKm 5.0 -HardCapDeg $DegLimit
+    & $EmitEvent @{
+        stage      = 'setup'
+        message    = 'Identifying required SRTM tiles'
+        cache_key  = $key
+        eff_deg    = [math]::Round($effDeg, 3)
+    }
+    $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $effDeg
 
     # -------- Fetch phase (parallel) --------------------------------------
     $fetchSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -551,6 +590,16 @@ function Invoke-SplatComputeStreaming {
         return
     }
     $fetchSw.Stop()
+
+    # Phase 13: emit the effective bbox half-width for the browser log.
+    # splat itself does the integer-tile snap; we just hand it the half-width
+    # via -bbox so it bypasses the max_range/57 derivation that would
+    # otherwise round up to extra tiles when the TX sits near a tile edge.
+    & $EmitEvent @{
+        stage      = 'bbox'
+        message    = "Compute bbox half-width: $([math]::Round($effDeg, 3)) deg"
+        eff_deg    = [math]::Round($effDeg, 3)
+    }
 
     # -------- Write qth + lrp -------------------------------------------------
     $name = 'live'
@@ -581,8 +630,14 @@ function Invoke-SplatComputeStreaming {
     & $EmitEvent @{ stage='splat_start'; message='Running ITWOM propagation' }
     $splatSw = [System.Diagnostics.Stopwatch]::StartNew()
 
+    # Phase 13: -bbox <eff_deg> tells splat-hd to use this half-width for
+    # the analysis box instead of deriving one from -R. Coverage cutoff is
+    # still set by -R; bbox is set independently by -bbox. Net effect: the
+    # rendered image shrinks to ~(2*eff_deg)x(2*eff_deg) degrees and the
+    # ray count drops proportionally.
     $argList = @('-d', $SdfDir, '-t', "$name.qth",
                  '-L', "$rxHeightM", '-R', "$rangeKm",
+                 '-bbox', "$([math]::Round($effDeg, 4))",
                  '-dbm', '-metric', '-geo', '-o', "$name.png")
     $proc = Start-Process -FilePath $SplatHdExe -ArgumentList $argList `
               -WorkingDirectory $serveDir -NoNewWindow -PassThru `
