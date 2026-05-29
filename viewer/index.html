@@ -307,7 +307,11 @@
     <!-- ============== Scenarios tab ============== -->
     <div class="tab" data-tab="scenarios">
       <h2>Scenarios</h2>
-      <div class="tab-subtitle">Every cached compute is a toggleable overlay. Show multiple at once in different colors to compare.</div>
+      <div class="tab-subtitle">
+        Every cached compute can be reopened instantly &mdash; no recompute. Click
+        <b style="color:#80e090;">Open</b> on any card to load its overlay + settings,
+        or tick <b>Show</b> to layer multiple in different colors for comparison.
+      </div>
 
       <div id="compCacheHeader" class="status">
         <span style="opacity:0.7;">Loading&hellip;</span>
@@ -936,12 +940,19 @@
       applyScenarioStyle(key);
     });
 
-    const loadBtn = document.createElement('button');
-    loadBtn.textContent = 'Load settings';
-    loadBtn.title = 'Restore TX position + form values to match this scenario (does NOT toggle overlay)';
-    loadBtn.addEventListener('click', () => loadScenarioSettings(entry));
+    // Phase 19c.1: "Open" is the one-click "I want to see this saved
+    // scenario in full" action -- it loads the cached overlay onto the
+    // map, restores the form state, places the TX marker, and zooms to
+    // the coverage bounds. All deterministic + instant (no compute).
+    // The Show checkbox above is still there for additive multi-overlay
+    // comparison without changing the form.
+    const openBtn = document.createElement('button');
+    openBtn.textContent = '📂 Open';
+    openBtn.className = 'primary';
+    openBtn.title = 'Show the cached overlay + restore form values + fit map to coverage. Instant, no recompute.';
+    openBtn.addEventListener('click', () => openScenario(entry));
 
-    row2.appendChild(cbLabel); row2.appendChild(op); row2.appendChild(loadBtn);
+    row2.appendChild(cbLabel); row2.appendChild(op); row2.appendChild(openBtn);
 
     card.appendChild(row1); card.appendChild(meta); card.appendChild(row2);
 
@@ -954,8 +965,15 @@
     }
     return card;
   }
-  function loadScenarioSettings(entry) {
+  // Phase 19c.1: combined "instant view" of a cached scenario. Shows the
+  // overlay (lazy-fetches the cached PNG/geo if not already loaded), restores
+  // the form fields, places the TX marker, fits the map to the coverage
+  // bounds, and brings this scenario's overlay to the front. No compute,
+  // no SRTM fetch, ~50 ms round-trip. Other currently-visible scenarios
+  // stay where they are -- this is "focus on X" not "hide everything else."
+  async function openScenario(entry) {
     const r = entry.request || {};
+    // 1. Restore form fields
     if (r.freq_mhz       !== undefined) freqInp.value   = r.freq_mhz;
     if (r.watts          !== undefined) wattsInp.value  = r.watts;
     if (r.gain_dbi       !== undefined) gainInp.value   = r.gain_dbi;
@@ -963,14 +981,22 @@
     if (r.range_mi       !== undefined) rangeInp.value  = r.range_mi;
     if (r.draft          !== undefined) document.getElementById('draft').checked = r.draft;
     saveSettings();
+    // 2. Place TX marker
     if (r.lat !== undefined && r.lon !== undefined) {
       setTx(r.lat, r.lon);
-      map.setView([r.lat, r.lon], Math.max(map.getZoom(), 9));
     }
+    // 3. Show overlay (cached -- instant) + 4. fit map to its bounds
     activeScenarioKey = entry.key;
+    const bounds = await showScenario(entry.key);
+    if (bounds) {
+      map.fitBounds(bounds);
+      // Make sure this scenario's overlay paints over any others currently shown
+      const ov = scenarioOverlays.get(entry.key);
+      if (ov && ov.overlay.bringToFront) ov.overlay.bringToFront();
+    }
     renderCompCacheList(_lastCompReport);
-    toast('Form restored. Click Compute to re-run (cache hit, ~0.1s).', {
-      kind: 'info', title: 'Loaded settings'
+    toast('Cached overlay loaded — no recompute needed.', {
+      kind: 'info', title: 'Opened', durationMs: 3500
     });
   }
   async function deleteCachedScenario(key) {
@@ -992,12 +1018,26 @@
       toast(e.message, { kind: 'error', title: 'Delete failed' });
     }
   }
+  let _firstCompFetchDone = false;
   async function refreshCompCache() {
     try {
       const r = await fetch('/cache/compute');
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const rep = await r.json();
       renderCompCacheList(rep);
+      // Phase 19c.1: one-shot toast on first load showing how many cached
+      // scenarios are being auto-restored from last session. Makes the
+      // "your previous overlays just came back" behavior discoverable
+      // instead of magical-looking.
+      if (!_firstCompFetchDone) {
+        _firstCompFetchDone = true;
+        const restoring = rep.entries.filter(e => scenarioState.get(e.key)?.shown).length;
+        if (restoring > 0) {
+          toast(`${restoring} cached overlay${restoring === 1 ? '' : 's'} restored from last session.`,
+                { kind: 'info', title: 'Welcome back', durationMs: 4000,
+                  hint: 'Click "📊 Scenarios" to manage them. Open a card to view + restore settings.' });
+        }
+      }
     } catch (e) {
       compCacheHeader.textContent = 'Compute cache unavailable: ' + e.message;
     }
