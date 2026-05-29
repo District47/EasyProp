@@ -50,3 +50,6 @@ desktop.ini
 
 # --- Claude Code harness state (per-machine, never tracked) ---
 .claude/
+
+# Release artifacts (built by scripts/build_release.ps1, uploaded to GitHub Releases)
+EasyProp-win-*.zip
