@@ -47,6 +47,14 @@ configure_file(
 
 include(cmake/Dependencies.cmake)
 
+# OpenMP -- used to parallelize the 4 edge loops in PlotLRMap and to give
+# each worker thread its own thread_local path/elev scratch + thread_local
+# itwom static caches. MSVC ships OpenMP 2.0 (sufficient for our static-
+# schedule int-counted loops); gcc/clang ship newer. Required, not optional:
+# the splat.cpp pragmas degrade to serial without it but the build flag
+# also defines _OPENMP which we use to gate omp_get_max_threads() calls.
+find_package(OpenMP REQUIRED)
+
 # ---------------------------------------------------------------------------
 # splat executable
 # ---------------------------------------------------------------------------
@@ -61,7 +69,7 @@ target_include_directories(splat PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"   # generated splat_config.h
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-target_link_libraries(splat PRIVATE BZip2::BZip2 TIFF::TIFF)
+target_link_libraries(splat PRIVATE BZip2::BZip2 TIFF::TIFF OpenMP::OpenMP_CXX)
 
 if(MSVC)
   target_compile_definitions(splat PRIVATE

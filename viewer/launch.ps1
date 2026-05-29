@@ -46,7 +46,15 @@ param(
     # fail with permission-denied writing tile downloads.
     [string]$SourceDir  = "$env:LOCALAPPDATA\EasyProp\work-hd",
     [string]$SdfDir     = "",
-    [string]$SplatHdExe = "C:\splat-build-hd\Release\splat-hd.exe",
+    # Both binaries now ship out of one build tree at C:\splat-build (the older
+    # C:\splat-build-hd path is kept as a fallback for users who haven't
+    # reconfigured yet, but the unified tree is preferred so the Phase-12
+    # OpenMP-parallelized splat-hd is picked up automatically).
+    [string]$SplatHdExe = $(if (Test-Path 'C:\splat-build\Release\splat-hd.exe') {
+                              'C:\splat-build\Release\splat-hd.exe'
+                          } else {
+                              'C:\splat-build-hd\Release\splat-hd.exe'
+                          }),
     [string]$SrtmTool   = "C:\splat-build\utils\Release\srtm2sdf-hd.exe",
     # Cache dir for previously-computed (lat,lon,freq,power,gain,antenna_h,
     # range,pol) -> png+geo pairs. A cache hit serves the saved image in

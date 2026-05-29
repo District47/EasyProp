@@ -26,6 +26,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <bzlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "compat/platform.h"
 #include "fontdata.h"
 #include "render/Image.h"
@@ -139,7 +142,14 @@ struct site {	double lat;
 		char filename[255];
 	    } 	site;
 
-struct path {	double lat[ARRAYSIZE];
+/* Thread-local so OpenMP can parallelize PlotLRMap's per-radial loop:
+   each worker thread builds and consumes its own path buffer without
+   stomping on its peers. ARRAYSIZE * 4 doubles per thread (~5 MB at
+   HD/MAXPAGES=9) is fine on Windows static TLS for an EXE main image.
+   ElevationAngle2's "temp=path; ReadPath(); ...; path=temp" save/restore
+   still works because temp is also per-thread (function local). */
+thread_local struct path {
+		double lat[ARRAYSIZE];
 		double lon[ARRAYSIZE];
 		double elevation[ARRAYSIZE];
 		double distance[ARRAYSIZE];
@@ -202,7 +212,10 @@ struct region { unsigned char color[32][3];
 		int levels;
 	      }	region;
 
-double elev[ARRAYSIZE+10];
+/* Thread-local for the same reason as `path` above: PlotLRPath fills
+   this buffer just before calling point_to_point, and we parallelize at
+   PlotLRPath granularity. Each thread keeps its own ~1 MB scratch. */
+thread_local double elev[ARRAYSIZE+10];
 
 void point_to_point(double elev[], double tht_m, double rht_m,
 	  double eps_dielect, double sgm_conductivity, double eno_ns_surfref,
@@ -3240,22 +3253,15 @@ void PlotLRMap(struct site source, double altitude, char *plo_filename)
 	   of a topographic map when the WritePPMLR() or
 	   WritePPMSS() functions are later invoked. */
 
-	int y, z, count;
-	struct site edge;
-	double lat, lon, minwest, maxnorth, th;
-	unsigned char x, symbol[4];
+	/* Layout locals: parallel-loop iteration is i-driven, so we drop the
+	   old (lat,lon,x,y,z,count,th,symbol) per-iteration state -- the new
+	   loops compute their lon/lat from i directly. */
+	double minwest, maxnorth;
 	static unsigned char mask_value=1;
 	FILE *fd=NULL;
 
 	minwest=dpp+(double)min_west;
 	maxnorth=(double)max_north-dpp;
-
-	symbol[0]='.';
-	symbol[1]='o';
-	symbol[2]='O';
-	symbol[3]='o';
-
-	count=0;
 
 	if (olditm)
 		fprintf(stdout,"\nComputing ITM ");
@@ -3271,14 +3277,13 @@ void PlotLRMap(struct site source, double altitude, char *plo_filename)
 		else
 			fprintf(stdout,"field strength");
 	}
- 
+
 	fprintf(stdout," contours of \"%s\"\nout to a radius of %.2f %s with an RX antenna at %.2f %s AGL",source.name,metric?max_range*KM_PER_MILE:max_range,metric?"kilometers":"miles",metric?altitude*METERS_PER_FOOT:altitude,metric?"meters":"feet");
 
 	if (clutter>0.0)
 		fprintf(stdout,"\nand %.2f %s of ground clutter",metric?clutter*METERS_PER_FOOT:clutter,metric?"meters":"feet");
 
-	fprintf(stdout,"...\n\n 0%c to  25%c ",37,37);
-	fflush(stdout);
+	fprintf(stdout, "...");
 
 	if (plo_filename[0]!=0)
 		fd=fopen(plo_filename,"wb");
@@ -3290,124 +3295,80 @@ void PlotLRMap(struct site source, double altitude, char *plo_filename)
 		fprintf(fd,"%d, %d\t; max_west, min_west\n%d, %d\t; max_north, min_north\n",max_west, min_west, max_north, min_north);
 	}
 
-	/* th=pixels/degree divided by 64 loops per
-	   progress indicator symbol (.oOo) printed. */
-	
-	th=ppd/64.0;
-
-	z=(int)(th*ReduceAngle(max_west-min_west));
-
-	for (lon=minwest, x=0, y=0; (LonDiff(lon,(double)max_west)<=0.0); y++, lon=minwest+(dpp*(double)y))
-	{
-		if (lon>=360.0)
-			lon-=360.0;
-
-		edge.lat=max_north;
-		edge.lon=lon;
-		edge.alt=altitude;
-
-		PlotLRPath(source,edge,mask_value,fd);
-		count++;
-
-		if (count==z) 
-		{
-			fprintf(stdout,"%c",symbol[x]);
-			fflush(stdout);
-			count=0;
-
-			if (x==3)
-				x=0;
-			else
-				x++;
-		}
-	}
-
-	count=0;
-	fprintf(stdout,"\n25%c to  50%c ",37,37);
-	fflush(stdout);
-	
-	z=(int)(th*(double)(max_north-min_north));
-
-	for (lat=maxnorth, x=0, y=0; lat>=(double)min_north; y++, lat=maxnorth-(dpp*(double)y))
-	{
-		edge.lat=lat;
-		edge.lon=min_west;
-		edge.alt=altitude;
-
-		PlotLRPath(source,edge,mask_value,fd);
-		count++;
-
-		if (count==z) 
-		{
-			fprintf(stdout,"%c",symbol[x]);
-			fflush(stdout);
-			count=0;
-
-			if (x==3)
-				x=0;
-			else
-				x++;
-		}
-	}
-
-	count=0;
-	fprintf(stdout,"\n50%c to  75%c ",37,37);
+	/* OpenMP-parallel rewrite of the original 4 edge loops. The originals
+	   used non-canonical `for (lon=...; LonDiff(...)<=0; y++, lon=...+dpp*y)`
+	   form which MSVC's OpenMP 2.0 won't accept; and they incrementally
+	   printed `.oOo` progress dots from inside the loop, which becomes a
+	   write-race under parallel execution. We pre-compute each edge's ray
+	   count, drop the per-dot progress (printing one summary line per
+	   quadrant instead), and use the canonical `for int i = 0..N-1`
+	   form so `#pragma omp parallel for` can chunk it across threads.
+	   Parallelism is gated on `fd==NULL`: when writing an .ano file the
+	   per-ray fprintf calls would interleave and corrupt the output, so we
+	   fall back to serial in that case. */
+	int n_lon = (int)(ReduceAngle(max_west - min_west) * ppd);
+	int n_lat = (int)((double)(max_north - min_north) * ppd);
+	int n_threads = 1;
+#ifdef _OPENMP
+	if (fd == NULL) n_threads = omp_get_max_threads();
+#endif
+	fprintf(stdout, " (%d threads, %d rays)\n", n_threads, 2 * (n_lon + n_lat));
+	fprintf(stdout, " 0%c to  25%c ", 37, 37);
 	fflush(stdout);
 
-	z=(int)(th*ReduceAngle(max_west-min_west));
-
-	for (lon=minwest, x=0, y=0; (LonDiff(lon,(double)max_west)<=0.0); y++, lon=minwest+(dpp*(double)y))
-	{
-		if (lon>=360.0)
-			lon-=360.0;
-
-		edge.lat=min_north;
-		edge.lon=lon;
-		edge.alt=altitude;
-
-		PlotLRPath(source,edge,mask_value,fd);
-		count++;
-
-		if (count==z)
-		{
-			fprintf(stdout,"%c",symbol[x]);
-			fflush(stdout);
-			count=0;
-
-			if (x==3)
-				x=0;
-			else
-				x++;
-		}
+	/* Edge 1: north edge -- sweep longitude west-to-east at lat=max_north */
+#pragma omp parallel for schedule(dynamic, 8) if(fd==NULL)
+	for (int i = 0; i < n_lon; i++) {
+		double lon_i = minwest + dpp * (double)i;
+		if (lon_i >= 360.0) lon_i -= 360.0;
+		struct site e;
+		e.lat = max_north;
+		e.lon = lon_i;
+		e.alt = altitude;
+		PlotLRPath(source, e, mask_value, fd);
 	}
-
-	count=0;
-	fprintf(stdout,"\n75%c to 100%c ",37,37);
+	fprintf(stdout, "..........................");
+	fprintf(stdout, "\n25%c to  50%c ", 37, 37);
 	fflush(stdout);
-	
-	z=(int)(th*(double)(max_north-min_north));
 
-	for (lat=(double)min_north, x=0, y=0; lat<(double)max_north; y++, lat=(double)min_north+(dpp*(double)y))
-	{
-		edge.lat=lat;
-		edge.lon=max_west;
-		edge.alt=altitude;
-
-		PlotLRPath(source,edge,mask_value,fd);
-		count++;
-
-		if (count==z)
-		{
-			fprintf(stdout,"%c",symbol[x]);
-			fflush(stdout);
-			count=0;
-
-			if (x==3)
-				x=0;
-			else
-				x++;
-		}
+	/* Edge 2: east edge -- sweep latitude north-to-south at lon=min_west */
+#pragma omp parallel for schedule(dynamic, 8) if(fd==NULL)
+	for (int i = 0; i < n_lat; i++) {
+		struct site e;
+		e.lat = maxnorth - dpp * (double)i;
+		e.lon = (double)min_west;
+		e.alt = altitude;
+		PlotLRPath(source, e, mask_value, fd);
 	}
+	fprintf(stdout, "..........................");
+	fprintf(stdout, "\n50%c to  75%c ", 37, 37);
+	fflush(stdout);
+
+	/* Edge 3: south edge -- sweep longitude west-to-east at lat=min_north */
+#pragma omp parallel for schedule(dynamic, 8) if(fd==NULL)
+	for (int i = 0; i < n_lon; i++) {
+		double lon_i = minwest + dpp * (double)i;
+		if (lon_i >= 360.0) lon_i -= 360.0;
+		struct site e;
+		e.lat = (double)min_north;
+		e.lon = lon_i;
+		e.alt = altitude;
+		PlotLRPath(source, e, mask_value, fd);
+	}
+	fprintf(stdout, "..........................");
+	fprintf(stdout, "\n75%c to 100%c ", 37, 37);
+	fflush(stdout);
+
+	/* Edge 4: west edge -- sweep latitude south-to-north at lon=max_west */
+#pragma omp parallel for schedule(dynamic, 8) if(fd==NULL)
+	for (int i = 0; i < n_lat; i++) {
+		struct site e;
+		e.lat = (double)min_north + dpp * (double)i;
+		e.lon = (double)max_west;
+		e.alt = altitude;
+		PlotLRPath(source, e, mask_value, fd);
+	}
+	fprintf(stdout, "..........................");
 
 	if (fd!=NULL)
 		fclose(fd);
@@ -4828,7 +4789,7 @@ static inline render::Color ss_legend_pixel(int x0, int y0, int colorwidth)
 			if (fontdata[16*('B')+(y0-8)] & (128 >> (x-44)))
 				indx = 255;
 		if (x >= 52 && x <= 59)
-			if (fontdata[16*(230)+(y0-8)] & (128 >> (x-52)))     /* µ (mu) */
+			if (fontdata[16*(230)+(y0-8)] & (128 >> (x-52)))     /* ?? (mu) */
 				indx = 255;
 		if (x >= 60 && x <= 67)
 			if (fontdata[16*('V')+(y0-8)] & (128 >> (x-60)))
