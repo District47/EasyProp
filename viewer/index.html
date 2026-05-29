@@ -433,10 +433,17 @@
       map.fitBounds(bounds);
 
       const dtTotal = ((performance.now() - t0) / 1000).toFixed(1);
-      const fetchNote = ev.tiles_fetched > 0
-        ? ` · fetched ${ev.tiles_fetched} SRTM tile${ev.tiles_fetched > 1 ? 's' : ''} (${ev.fetch_sec.toFixed(1)}s)`
-        : (ev.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
-      setStatus(`Done ${dtTotal}s · splat ${ev.elapsed_sec.toFixed(1)}s${fetchNote}`, 'ok');
+      if (ev.cached) {
+        // Cache hit -- skipped fetch + splat entirely. Total wall time is
+        // really just "how fast did the browser receive + decode the PNG."
+        setStatus(`Done ${dtTotal}s · served from cache (${ev.cache_key})`, 'ok');
+        setStage(`cache hit ${ev.cache_key}`);
+      } else {
+        const fetchNote = ev.tiles_fetched > 0
+          ? ` · fetched ${ev.tiles_fetched} SRTM tile${ev.tiles_fetched > 1 ? 's' : ''} (${ev.fetch_sec.toFixed(1)}s)`
+          : (ev.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
+        setStatus(`Done ${dtTotal}s · splat ${ev.elapsed_sec.toFixed(1)}s${fetchNote} · cached as ${ev.cache_key}`, 'ok');
+      }
     } catch (e) {
       setStatus('FAIL: ' + e.message, 'err');
       setStage('failed');

@@ -48,6 +48,12 @@ param(
     [string]$SdfDir     = "",
     [string]$SplatHdExe = "C:\splat-build-hd\Release\splat-hd.exe",
     [string]$SrtmTool   = "C:\splat-build\utils\Release\srtm2sdf-hd.exe",
+    # Cache dir for previously-computed (lat,lon,freq,power,gain,antenna_h,
+    # range,pol) -> png+geo pairs. A cache hit serves the saved image in
+    # ~100 ms instead of re-running the 2-minute splat. Files accumulate
+    # forever -- you manage size by `Remove-Item $env:LOCALAPPDATA\EasyProp\
+    # cache\*` if it grows too large (~15 MB per cached scenario).
+    [string]$CacheDir   = "$env:LOCALAPPDATA\EasyProp\cache",
     # deg_limit from splat.cpp main()'s switch(MAXPAGES). For an HD build
     # with MAXPAGES=9, splat caps its analysis half-width at 1.0 degrees
     # in both lat and lon, meaning it loads (and sea-level-fills) a 3x3
@@ -73,6 +79,10 @@ else {
     if (-not (Test-Path $SdfDir)) { New-Item -ItemType Directory -Force -Path $SdfDir | Out-Null }
     $SdfDir = (Resolve-Path $SdfDir).Path
 }
+if (-not (Test-Path $CacheDir)) {
+    New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+}
+$CacheDir = (Resolve-Path $CacheDir).Path
 
 # Sanity check: refuse to write into Windows / Program Files, even if the
 # user explicitly pointed us there. Better to fail loudly here than to mask
@@ -421,6 +431,71 @@ function Parse-SplatProgress {
     return [pscustomobject]@{ Phase='starting'; Percent=0 }
 }
 
+# Bump this whenever splat-hd or the rendering logic changes in a way that
+# would invalidate previously-cached PNGs. Cached files from a different
+# schema simply won't be found by Get-CacheKey and the next run will
+# regenerate. Stale files are inert -- delete the cache dir to clean them up.
+$script:CACHE_SCHEMA = 'v1'
+
+function Get-CacheKey {
+    # Canonicalize the request into a stable JSON document, then SHA-256 it.
+    # lat/lon round to ~11 m so that two clicks "at the same spot" hit cache.
+    # 16 hex chars (64 bits) of hash is plenty for collision avoidance at the
+    # scale of "user cache directory."
+    param([pscustomobject]$Req)
+    $canon = [pscustomobject]@{
+        schema           = $script:CACHE_SCHEMA
+        lat              = [math]::Round([double]$Req.lat,              4)
+        lon              = [math]::Round([double]$Req.lon,              4)
+        freq_mhz         = [math]::Round([double]$Req.freq_mhz,         3)
+        watts            = [math]::Round([double]$Req.watts,            3)
+        gain_dbi         = [math]::Round([double]$Req.gain_dbi,         2)
+        antenna_height_m = [math]::Round([double]$Req.antenna_height_m, 2)
+        range_mi         = [math]::Round([double]$Req.range_mi,         2)
+        polarization     = "$($Req.polarization)"
+    }
+    $json = $canon | ConvertTo-Json -Compress
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $hex   = ($sha.ComputeHash($bytes) | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+        return $hex.Substring(0, 16)
+    } finally { $sha.Dispose() }
+}
+
+function Test-CacheHit {
+    param([string]$CacheDir, [string]$Key)
+    $png = Join-Path $CacheDir "$Key.png"
+    $geo = Join-Path $CacheDir "$Key.geo"
+    return (Test-Path $png) -and (Test-Path $geo)
+}
+
+function Copy-CacheTo {
+    # Cache hit: copy the previously-computed png+geo into the live.* slots
+    # the browser polls.
+    param([string]$CacheDir, [string]$Key, [string]$ServeDir)
+    Copy-Item (Join-Path $CacheDir "$Key.png") (Join-Path $ServeDir 'live.png') -Force
+    Copy-Item (Join-Path $CacheDir "$Key.geo") (Join-Path $ServeDir 'live.geo') -Force
+}
+
+function Save-Cache {
+    # After a successful compute, archive the live.* outputs into the cache
+    # so the next identical request becomes a hit.
+    param([string]$CacheDir, [string]$Key, [string]$ServeDir, [pscustomobject]$Req)
+    Copy-Item (Join-Path $ServeDir 'live.png') (Join-Path $CacheDir "$Key.png") -Force
+    Copy-Item (Join-Path $ServeDir 'live.geo') (Join-Path $CacheDir "$Key.geo") -Force
+    # Also write a small JSON sidecar so a human (or a future cleanup script)
+    # can tell what each cached scenario actually was.
+    $meta = [pscustomobject]@{
+        schema    = $script:CACHE_SCHEMA
+        key       = $Key
+        cached_at = (Get-Date).ToString('o')
+        request   = $Req
+    }
+    $meta | ConvertTo-Json -Depth 4 |
+        Set-Content -Path (Join-Path $CacheDir "$Key.json") -Encoding utf8
+}
+
 function Invoke-SplatComputeStreaming {
     # End-to-end compute pipeline that emits progress events for the browser:
     #   1. setup        -- identifying required tiles
@@ -433,7 +508,29 @@ function Invoke-SplatComputeStreaming {
     #   8. error        -- on failure at any stage (terminates the stream)
     param([pscustomobject]$Req, [scriptblock]$EmitEvent)
 
-    & $EmitEvent @{ stage='setup'; message='Identifying required SRTM tiles' }
+    # -------- Cache check (first thing) -----------------------------------
+    # Skip fetch + splat entirely for an identical previous request.
+    $key = Get-CacheKey -Req $Req
+    & $EmitEvent @{ stage='setup'; message='Checking cache'; cache_key=$key }
+    if (Test-CacheHit -CacheDir $CacheDir -Key $key) {
+        Copy-CacheTo -CacheDir $CacheDir -Key $key -ServeDir $serveDir
+        & $EmitEvent @{
+            stage          = 'done'
+            png            = 'live.png'
+            geo            = 'live.geo'
+            elapsed_sec    = 0
+            fetch_sec      = 0
+            tiles_needed   = 0
+            tiles_fetched  = 0
+            tiles_skipped  = 0
+            tiles_failed   = 0
+            cached         = $true
+            cache_key      = $key
+        }
+        return
+    }
+
+    & $EmitEvent @{ stage='setup'; message='Identifying required SRTM tiles'; cache_key=$key }
     $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $DegLimit
 
     # -------- Fetch phase (parallel) --------------------------------------
@@ -524,6 +621,15 @@ function Invoke-SplatComputeStreaming {
         return
     }
 
+    # Successful compute -- save into cache for next time.
+    try {
+        Save-Cache -CacheDir $CacheDir -Key $key -ServeDir $serveDir -Req $Req
+    } catch {
+        # Caching is best-effort; never fail the request just because we
+        # couldn't write to the cache dir.
+        Write-Host "  WARN: cache save failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+
     & $EmitEvent @{
         stage          = 'done'
         png            = 'live.png'
@@ -534,6 +640,8 @@ function Invoke-SplatComputeStreaming {
         tiles_fetched  = $fetchTally.ok
         tiles_skipped  = $fetchTally.skipped
         tiles_failed   = $fetchTally.failed
+        cached         = $false
+        cache_key      = $key
     }
 }
 
