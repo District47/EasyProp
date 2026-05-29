@@ -223,53 +223,232 @@ function Get-SdfName {
     '{0}_{1}_{2}_{3}-hd.sdf' -f $Lat, ($Lat+1), ($West-1), $West
 }
 
-function Ensure-SrtmTiles {
-    # Make sure every tile in the requested set has an *-hd.sdf in $SdfDir.
-    # Missing ones get fetched + converted via utils/fetch_srtm.ps1, which
-    # is itself idempotent (skips tiles whose .sdf already exists). Returns
-    # the number of tiles that were actually freshly fetched.
-    param([System.Collections.Generic.List[object]]$Tiles)
+function Fetch-MissingTilesAsync {
+    # Fetch each missing tile in parallel via Start-Job (one job per tile),
+    # invoking the supplied $EmitEvent callback as tiles complete so the
+    # caller can stream per-tile progress to the browser. Returns a hashtable
+    # with counters {ok, skipped (404), failed}.
+    #
+    # Each job downloads from the AWS Mapzen Skadi mirror first (gzipped raw
+    # hgt, comprehensive coastal coverage) then falls back to ESA SRTMGL1.
+    # The conversion (srtm2sdf-hd) runs inside the same job, so parallelism
+    # covers both download AND convert phases.
+    param(
+        [System.Collections.Generic.List[object]]$Tiles,
+        [string]$OutDir,
+        [string]$SrtmToolPath,
+        [scriptblock]$EmitEvent
+    )
+
+    # Filter to tiles whose SDF doesn't already exist.
     $needed = @()
     foreach ($t in $Tiles) {
         $name = Get-SdfName -Lat $t.Lat -West $t.West
-        if (-not (Test-Path (Join-Path $SdfDir $name))) {
+        if (-not (Test-Path (Join-Path $OutDir $name))) {
             $needed += $t
         }
     }
-    if ($needed.Count -eq 0) { return 0 }
-
-    $minLat  = ($needed | Measure-Object -Property Lat  -Minimum).Minimum
-    $maxLat  = ($needed | Measure-Object -Property Lat  -Maximum).Maximum
-    $minWest = ($needed | Measure-Object -Property West -Minimum).Minimum
-    $maxWest = ($needed | Measure-Object -Property West -Maximum).Maximum
-    $fetcher = Join-Path (Split-Path $PSScriptRoot -Parent) 'utils\fetch_srtm.ps1'
-
-    & $fetcher -MinLat $minLat -MaxLat $maxLat -MinWest $minWest -MaxWest $maxWest `
-               -OutDir $SdfDir -SrtmTool $SrtmTool | Out-Null
-
-    # Count how many of the originally-missing tiles are now present.
-    $fetched = 0
-    foreach ($t in $needed) {
-        if (Test-Path (Join-Path $SdfDir (Get-SdfName -Lat $t.Lat -West $t.West))) { $fetched++ }
+    $totalNeeded = $needed.Count
+    & $EmitEvent @{
+        stage         = 'fetch_start'
+        tiles_total   = $Tiles.Count
+        tiles_cached  = $Tiles.Count - $totalNeeded
+        tiles_to_fetch= $totalNeeded
     }
-    return $fetched
+    if ($totalNeeded -eq 0) {
+        & $EmitEvent @{ stage='fetch_done'; tiles_fetched=0; tiles_skipped=0; tiles_failed=0 }
+        return @{ ok=0; skipped=0; failed=0 }
+    }
+
+    # Per-tile worker scriptblock -- everything it needs must be passed in
+    # (Start-Job runs in a separate PowerShell process; outer-scope vars are
+    # NOT inherited).
+    $worker = {
+        param([int]$Lat, [int]$West, [string]$OutDir, [string]$SrtmTool)
+        $tile   = 'N{0:D2}W{1:D3}' -f $Lat, $West
+        $latPfx = 'N{0:D2}' -f $Lat
+        $mirrors = @(
+            @{ kind='gz';  url="https://s3.amazonaws.com/elevation-tiles-prod/skadi/$latPfx/$tile.hgt.gz" },
+            @{ kind='zip'; url="https://step.esa.int/auxdata/dem/SRTMGL1/$tile.SRTMGL1.hgt.zip" }
+        )
+        $hgt = $null
+        $mirrorTag = ''
+        $lastStatus = 0
+        $lastError = ''
+        foreach ($m in $mirrors) {
+            $tmp = Join-Path $OutDir ("$tile." + $(if ($m.kind -eq 'gz') {'hgt.gz'} else {'SRTMGL1.hgt.zip'}))
+            try {
+                Invoke-WebRequest -Uri $m.url -OutFile $tmp -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
+            } catch {
+                $lastError  = $_.Exception.Message
+                $lastStatus = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { 0 }
+                continue
+            }
+            $hgtPath = Join-Path $OutDir "$tile.hgt"
+            if ($m.kind -eq 'gz') {
+                $inStream  = [System.IO.File]::OpenRead($tmp)
+                $outStream = [System.IO.File]::Create($hgtPath)
+                try {
+                    $gz = [System.IO.Compression.GZipStream]::new($inStream, [System.IO.Compression.CompressionMode]::Decompress)
+                    $gz.CopyTo($outStream); $gz.Close()
+                } finally { $outStream.Close(); $inStream.Close() }
+                $hgt = $hgtPath
+            } else {
+                Expand-Archive -Path $tmp -DestinationPath $OutDir -Force
+                $found = Get-ChildItem -Path $OutDir -Filter "$tile*.hgt" | Select-Object -First 1
+                if ($found) { $hgt = $found.FullName }
+            }
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+            if ($hgt) { $mirrorTag = $m.kind; break }
+        }
+
+        if (-not $hgt) {
+            if ($lastStatus -eq 404) {
+                return [pscustomobject]@{ Tile=$tile; Lat=$Lat; West=$West; Status='skip'; Reason='404 from all mirrors (likely ocean)' }
+            }
+            return [pscustomobject]@{ Tile=$tile; Lat=$Lat; West=$West; Status='fail'; Reason=$lastError }
+        }
+
+        Push-Location $OutDir
+        $exit = 0
+        try {
+            & $SrtmTool ([System.IO.Path]::GetFileName($hgt)) 2>&1 | Out-Null
+            $exit = $LASTEXITCODE
+        } finally { Pop-Location }
+        Remove-Item $hgt -ErrorAction SilentlyContinue
+
+        if ($exit -ne 0) {
+            return [pscustomobject]@{ Tile=$tile; Lat=$Lat; West=$West; Status='fail'; Reason="srtm2sdf-hd exit $exit"; Mirror=$mirrorTag }
+        }
+        return [pscustomobject]@{ Tile=$tile; Lat=$Lat; West=$West; Status='ok'; Mirror=$mirrorTag }
+    }
+
+    # Spawn one parallel Start-Job per missing tile.
+    $jobs = @()
+    foreach ($t in $needed) {
+        $jobs += Start-Job -ScriptBlock $worker -ArgumentList $t.Lat, $t.West, $OutDir, $SrtmToolPath
+    }
+
+    # Poll the job pool, emit progress events as individual tiles finish.
+    $ok = 0; $skipped = 0; $failed = 0; $done = 0
+    while ($jobs.Count -gt 0) {
+        $finished = @($jobs | Where-Object { $_.State -in 'Completed','Failed','Stopped' })
+        foreach ($j in $finished) {
+            $result = Receive-Job $j 2>$null
+            Remove-Job $j -Force
+            $done++
+            switch ($result.Status) {
+                'ok'   { $ok++ }
+                'skip' { $skipped++ }
+                default{ $failed++ }
+            }
+            & $EmitEvent @{
+                stage       = 'fetch_progress'
+                tiles_done  = $done
+                tiles_total = $totalNeeded
+                tile        = $result.Tile
+                status      = $result.Status
+                mirror      = $result.Mirror
+                reason      = $result.Reason
+            }
+        }
+        $jobs = @($jobs | Where-Object { $_.State -notin 'Completed','Failed','Stopped' })
+        if ($jobs.Count -gt 0) { Start-Sleep -Milliseconds 250 }
+    }
+
+    & $EmitEvent @{ stage='fetch_done'; tiles_fetched=$ok; tiles_skipped=$skipped; tiles_failed=$failed }
+    return @{ ok=$ok; skipped=$skipped; failed=$failed }
 }
 
-function Invoke-SplatCompute {
-    param([pscustomobject]$Req)
-    $name = 'live'
+function Parse-SplatProgress {
+    # SPLAT! HD's stdout looks like:
+    #
+    #     Loading "X.sdf" into page 1... Done!
+    #     Region "Y" assumed as sea-level into page 2... Done!
+    #     ...
+    #     Computing ITWOM signal power level contours of "LIVE"
+    #     out to a radius of 48.28 kilometers with an RX antenna at 2.00 meters AGL...
+    #
+    #      0% to  25% .oOo.oOo.oOo.oOo. ...    <- 64 dots == 25% complete
+    #     25% to  50% .oOo.oOo. ...
+    #     50% to  75% ...
+    #     75% to 100% ...
+    #     Done!
+    #
+    #     Site analysis report written to: "LIVE-site_report.txt"
+    #
+    #     Writing "live.png" (10800x10800 png image)... Done!
+    #
+    # Map all that to a single (percent, phase) pair the browser can use to
+    # drive its progress bar.
+    param([string]$Text)
+    if (-not $Text) {
+        return [pscustomobject]@{ Phase='starting'; Percent=0 }
+    }
 
-    # 1. Auto-fetch any SRTM tiles the requested TX+range will need.
-    $fetchSw = [System.Diagnostics.Stopwatch]::StartNew()
+    # If we've seen the final "Writing ... Done!" we're 100% done.
+    if ($Text -match 'Writing\s+"[^"]+"[^\n]*\.\.\.\s+Done!\s*$') {
+        return [pscustomobject]@{ Phase='done'; Percent=100 }
+    }
+    # If we're in the PNG-write phase but haven't finished yet.
+    if ($Text -match 'Writing\s+"[^"]+"\s*\(([0-9x]+)') {
+        return [pscustomobject]@{ Phase='writing_png'; Percent=95 }
+    }
+
+    # During compute: find the LAST progress line and count dots.
+    $lines = $Text -split "`n"
+    $last  = $null
+    foreach ($l in $lines) {
+        if ($l -match '^\s*(\d+)%\s+to\s+(\d+)%\s*(.*)$') { $last = $l }
+    }
+    if ($last -and ($last -match '^\s*(\d+)%\s+to\s+(\d+)%\s*(.*)$')) {
+        $start  = [int]$Matches[1]
+        $end    = [int]$Matches[2]
+        $trail  = $Matches[3].TrimEnd()
+        $dots   = [math]::Min(64, $trail.Length)
+        $pct    = $start + ($dots / 64.0) * ($end - $start)
+        # Reserve the last 5% for the PNG-write phase that follows.
+        $pct    = [math]::Min(90, $pct * 0.9)
+        return [pscustomobject]@{ Phase='computing'; Percent=[math]::Round($pct) }
+    }
+
+    if ($Text -match 'Computing ITWOM') {
+        return [pscustomobject]@{ Phase='computing'; Percent=0 }
+    }
+    if ($Text -match 'Loading|Region') {
+        return [pscustomobject]@{ Phase='loading_tiles'; Percent=0 }
+    }
+    return [pscustomobject]@{ Phase='starting'; Percent=0 }
+}
+
+function Invoke-SplatComputeStreaming {
+    # End-to-end compute pipeline that emits progress events for the browser:
+    #   1. setup        -- identifying required tiles
+    #   2. fetch_start  -- announce how many tiles need fetching (rest cached)
+    #   3. fetch_progress (xN, one per tile as it completes in parallel)
+    #   4. fetch_done   -- fetch phase complete
+    #   5. splat_start  -- splat-hd launched
+    #   6. splat_progress (every ~1 sec while compute is running)
+    #   7. done         -- png + geo ready for the browser to overlay
+    #   8. error        -- on failure at any stage (terminates the stream)
+    param([pscustomobject]$Req, [scriptblock]$EmitEvent)
+
+    & $EmitEvent @{ stage='setup'; message='Identifying required SRTM tiles' }
     $required = Get-RequiredTiles -Lat $Req.lat -LonStd $Req.lon -RangeMi $Req.range_mi -DegLimit $DegLimit
-    $fetched  = 0
+
+    # -------- Fetch phase (parallel) --------------------------------------
+    $fetchSw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $fetched = Ensure-SrtmTiles -Tiles $required
+        $fetchTally = Fetch-MissingTilesAsync -Tiles $required -OutDir $SdfDir `
+                          -SrtmToolPath $SrtmTool -EmitEvent $EmitEvent
     } catch {
-        return @{ ok=$false; error="SRTM fetch failed: $($_.Exception.Message)" }
+        & $EmitEvent @{ stage='error'; error="SRTM fetch failed: $($_.Exception.Message)" }
+        return
     }
     $fetchSw.Stop()
 
+    # -------- Write qth + lrp -------------------------------------------------
+    $name = 'live'
     Write-Qth -Path (Join-Path $serveDir "$name.qth") `
               -Name 'LIVE' -Lat $Req.lat -LonStd $Req.lon `
               -HeightM $Req.antenna_height_m
@@ -278,62 +457,83 @@ function Invoke-SplatCompute {
               -GainDbi $Req.gain_dbi `
               -Polarization $Req.polarization
 
-    # Remove the previous live output so a failed run doesn't leave stale
-    # png/geo lying around for the browser to overlay.
     foreach ($f in @('live.png','live.geo','LIVE-site_report.txt')) {
         $p = Join-Path $serveDir $f
         if (Test-Path $p) { Remove-Item $p -Force }
     }
 
-    # SPLAT! flag choice -- this is the key bit that makes power/freq actually
-    # matter:
-    #   -c X  is LOS-only coverage with RX antenna at X meters AGL. Purely
-    #         geometric: where the TX can physically be seen over the terrain.
-    #         Doesn't look at the .lrp at all. Same result for 1W and 1MW.
-    #   -L X  is path-loss / signal-strength map with RX antenna at X meters
-    #         AGL. Runs ITWOM with the .lrp's frequency, ERP, climate, etc.
-    #         and emits colored contours of actual signal strength. THIS is
-    #         the mode that reflects the form's band/power/antenna inputs.
-    #   -dbm  switches the contour color bands from field strength
-    #         (dB-microV/m) to dBm (the more intuitive "-80 = weak,
-    #         -60 = strong" radio scale).
-    #   -R K  sets the analysis radius (kilometers when -metric is on, miles
-    #         otherwise). The form takes miles for familiarity, so convert.
-    #
-    # RX antenna height is hard-coded at 2 m (typical handheld receiver). A
-    # future form field could let the user pick a different RX.
+    # -------- Splat phase (async with progress polling) ----------------------
+    # See the inline comment in the previous Invoke-SplatCompute for the
+    # rationale behind -L vs -c, -dbm, -R-in-km, etc. RX antenna is 2 m AGL.
     $rxHeightM = 2.0
     $rangeKm   = [math]::Round($Req.range_mi * 1.609344, 2)
+    $stdout    = Join-Path $serveDir 'splat.stdout.txt'
+    $stderr    = Join-Path $serveDir 'splat.stderr.txt'
+    # Start-Process overwrites these files; no need to pre-create them, and
+    # pre-creating them with Set-Content actually causes Start-Process to fail
+    # to open them for redirection on some systems.
 
+    & $EmitEvent @{ stage='splat_start'; message='Running ITWOM propagation' }
     $splatSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $stdout = Join-Path $serveDir 'splat.stdout.txt'
-    $stderr = Join-Path $serveDir 'splat.stderr.txt'
+
     $argList = @('-d', $SdfDir, '-t', "$name.qth",
-                 '-L', "$rxHeightM",
-                 '-R', "$rangeKm",
+                 '-L', "$rxHeightM", '-R', "$rangeKm",
                  '-dbm', '-metric', '-geo', '-o', "$name.png")
     $proc = Start-Process -FilePath $SplatHdExe -ArgumentList $argList `
-              -WorkingDirectory $serveDir -NoNewWindow -Wait -PassThru `
+              -WorkingDirectory $serveDir -NoNewWindow -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+    $lastPct = -1
+    $lastPhase = ''
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 1000
+        try {
+            $text = [System.IO.File]::ReadAllText($stdout)
+        } catch { $text = '' }
+        $progress = Parse-SplatProgress $text
+        if ($progress.Percent -ne $lastPct -or $progress.Phase -ne $lastPhase) {
+            & $EmitEvent @{
+                stage   = 'splat_progress'
+                phase   = $progress.Phase
+                percent = $progress.Percent
+            }
+            $lastPct   = $progress.Percent
+            $lastPhase = $progress.Phase
+        }
+    }
+    # WaitForExit() is required even after HasExited goes true -- without it,
+    # the Process object's ExitCode property is unreliable when the process
+    # was started via Start-Process -PassThru (often comes back $null, which
+    # then fails `-ne 0` checks even on a successful run).
+    $proc.WaitForExit()
+    $exit = $proc.ExitCode
     $splatSw.Stop()
 
-    if ($proc.ExitCode -ne 0 -or -not (Test-Path (Join-Path $serveDir 'live.png'))) {
+    # Treat live.png existence as the primary success signal. ExitCode is the
+    # tiebreaker (e.g. splat might write a partial file then crash).
+    $pngPath = Join-Path $serveDir 'live.png'
+    if (-not (Test-Path $pngPath)) {
         $errText = ''
-        if (Test-Path $stderr) { $errText = (Get-Content $stderr -Raw) }
-        if ([string]::IsNullOrWhiteSpace($errText) -and (Test-Path $stdout)) {
-            $errText = (Get-Content $stdout -Tail 8 -Raw)
+        if (Test-Path $stderr) {
+            try { $errText = ((Get-Content $stderr -EA SilentlyContinue) -join "`n").Trim() } catch {}
         }
-        return @{ ok=$false; error=("splat-hd exit " + $proc.ExitCode + ": " + $errText.Trim()) }
+        if ([string]::IsNullOrWhiteSpace($errText) -and (Test-Path $stdout)) {
+            try { $errText = ((Get-Content $stdout -Tail 8 -EA SilentlyContinue) -join "`n").Trim() } catch {}
+        }
+        & $EmitEvent @{ stage='error'; error="splat-hd exit $exit (no output produced): $errText" }
+        return
     }
 
-    return @{
-        ok            = $true
-        png           = 'live.png'
-        geo           = 'live.geo'
-        elapsed_sec   = [math]::Round($splatSw.Elapsed.TotalSeconds, 2)
-        fetch_sec     = [math]::Round($fetchSw.Elapsed.TotalSeconds, 2)
-        tiles_needed  = $required.Count
-        tiles_fetched = $fetched
+    & $EmitEvent @{
+        stage          = 'done'
+        png            = 'live.png'
+        geo            = 'live.geo'
+        elapsed_sec    = [math]::Round($splatSw.Elapsed.TotalSeconds, 2)
+        fetch_sec      = [math]::Round($fetchSw.Elapsed.TotalSeconds, 2)
+        tiles_needed   = $required.Count
+        tiles_fetched  = $fetchTally.ok
+        tiles_skipped  = $fetchTally.skipped
+        tiles_failed   = $fetchTally.failed
     }
 }
 
@@ -364,25 +564,48 @@ try {
 
         try {
             if ($req.HttpMethod -eq 'POST' -and $req.Url.LocalPath -eq '/compute') {
-                # ---- /compute ----
+                # ---- /compute (streaming NDJSON) ----
+                # The browser POSTs the form data and reads the response body
+                # as a chunked stream of newline-delimited JSON events. Each
+                # `setup`, `fetch_start`, `fetch_progress`, `splat_progress`,
+                # `done` or `error` line is one chunk, flushed immediately, so
+                # the progress bar can advance in real time.
                 $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
                 $body = $reader.ReadToEnd()
                 $reader.Close()
-                Write-Host ("  [{0}] POST /compute  {1}" -f (Get-Date -Format 'HH:mm:ss'), $body.Substring(0, [math]::Min(120, $body.Length))) -ForegroundColor Yellow
+                Write-Host ("  [{0}] POST /compute  {1}" -f (Get-Date -Format 'HH:mm:ss'),
+                            $body.Substring(0, [math]::Min(120, $body.Length))) -ForegroundColor Yellow
+
+                $res.ContentType  = 'application/x-ndjson; charset=utf-8'
+                $res.SendChunked  = $true
+
+                # Closure-captures $res so the streaming compute can flush
+                # one JSON line per event as it works.
+                $emit = {
+                    param([hashtable]$Event)
+                    $line  = ($Event | ConvertTo-Json -Compress -Depth 6) + "`n"
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $res.OutputStream.Flush()
+                    # Mirror key events to the server console so the operator
+                    # can follow along too.
+                    if ($Event.stage -in @('fetch_done','splat_start','done','error')) {
+                        $ts = Get-Date -Format 'HH:mm:ss'
+                        $col = if ($Event.stage -eq 'error') { 'Red' } elseif ($Event.stage -eq 'done') { 'Green' } else { 'DarkCyan' }
+                        Write-Host ("  [{0}] {1}" -f $ts, ($Event | ConvertTo-Json -Compress -Depth 6)) -ForegroundColor $col
+                    }
+                }
+
                 try {
                     $reqObj = $body | ConvertFrom-Json
-                    $result = Invoke-SplatCompute -Req $reqObj
+                    Invoke-SplatComputeStreaming -Req $reqObj -EmitEvent $emit
                 } catch {
-                    $result = @{ ok=$false; error=$_.Exception.Message }
+                    # Best-effort: tell the browser even if the failure was
+                    # before/during the stream.
+                    try {
+                        & $emit @{ stage='error'; error=$_.Exception.Message }
+                    } catch { Write-Host "  ERROR (post-stream): $($_.Exception.Message)" -ForegroundColor Red }
                 }
-                $color = if ($result.ok) { 'Green' } else { 'Red' }
-                Write-Host ("  [{0}] -> {1}" -f (Get-Date -Format 'HH:mm:ss'),
-                            ($result | ConvertTo-Json -Compress)) -ForegroundColor $color
-                $json = $result | ConvertTo-Json -Compress
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-                $res.ContentType = 'application/json; charset=utf-8'
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
 
             } else {
                 # ---- static GET ----

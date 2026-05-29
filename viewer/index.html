@@ -49,6 +49,38 @@
   .splat-panel .row { display: flex; gap: 6px; }
   .splat-panel .row > label { flex: 1; }
 
+  /* Progress bar -- shown only while a compute is in flight */
+  .splat-progress {
+    display: none;
+    margin-top: 6px;
+    height: 6px;
+    background: #eee;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .splat-progress.active { display: block; }
+  .splat-progress > .fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #5af, #2c7);
+    transition: width 0.4s ease;
+  }
+  /* Indeterminate animation when we don't yet have a numeric % to show */
+  .splat-progress.indeterminate > .fill {
+    width: 30% !important;
+    animation: splat-pulse 1.4s ease-in-out infinite;
+    background: linear-gradient(90deg, #9cf, #69b);
+  }
+  @keyframes splat-pulse {
+    0%   { margin-left: -30%; }
+    100% { margin-left: 100%; }
+  }
+  .splat-stage {
+    font-size: 10px; color: #888;
+    margin-top: 3px; text-align: right;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+
   .splat-tx-marker {
     background: #c00; width: 14px; height: 14px; border-radius: 50%;
     border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);
@@ -132,6 +164,9 @@
 
       <button id="compute" class="primary" disabled>Compute coverage</button>
       <div id="status" class="status">Place a transmitter to begin.</div>
+      <div id="progress" class="splat-progress"><div class="fill"></div></div>
+      <div id="stage" class="splat-stage"></div>
+      <div id="elapsed" class="splat-stage" style="text-align:left;"></div>
 
       <h4>Overlay</h4>
       <label>Opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.6"></label>
@@ -240,13 +275,112 @@
     return bounds;
   }
 
+  // --- Progress bar plumbing ---
+  const progressEl = $('progress');
+  const fillEl     = progressEl.querySelector('.fill');
+  const stageEl    = $('stage');
+  const elapsedEl  = $('elapsed');
+  let elapsedTimer = null;
+
+  function showProgress(on)        { progressEl.classList.toggle('active', on); }
+  function setProgressIndet(on)    { progressEl.classList.toggle('indeterminate', on); }
+  function setProgressPercent(pct) { fillEl.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+  function setStage(text)          { stageEl.textContent = text || ''; }
+
+  function startElapsedTimer(t0) {
+    stopElapsedTimer();
+    elapsedTimer = setInterval(() => {
+      const s = (performance.now() - t0) / 1000;
+      const m = Math.floor(s / 60), r = Math.floor(s % 60);
+      elapsedEl.textContent = `elapsed ${m}:${r.toString().padStart(2,'0')}`;
+    }, 250);
+  }
+  function stopElapsedTimer() {
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  }
+
+  // Map a single streaming event from the server onto the progress bar +
+  // status line. Total work is split 0-30% fetch, 30-95% compute, 95-100%
+  // PNG write. Fetch and splat sub-progress fill their bands smoothly.
+  function applyEvent(ev) {
+    switch (ev.stage) {
+      case 'setup':
+        setStage('identifying tiles');
+        setProgressIndet(true);
+        break;
+
+      case 'fetch_start':
+        if (ev.tiles_to_fetch > 0) {
+          setStage(`fetching ${ev.tiles_to_fetch} SRTM tile${ev.tiles_to_fetch>1?'s':''} (parallel)`);
+          setProgressIndet(false);
+          setProgressPercent(2);
+          setStatus(`Fetching ${ev.tiles_to_fetch} SRTM tile${ev.tiles_to_fetch>1?'s':''}… (${ev.tiles_cached} cached)`, 'busy');
+        } else {
+          setStage('all SRTM tiles cached');
+          setProgressPercent(30);
+          setStatus('All SRTM tiles cached, starting compute…', 'busy');
+        }
+        break;
+
+      case 'fetch_progress':
+        // 0-30% of overall: scale tile count.
+        if (ev.tiles_total > 0) {
+          setProgressPercent(2 + 28 * ev.tiles_done / ev.tiles_total);
+          setStage(`fetched ${ev.tiles_done}/${ev.tiles_total}: ${ev.tile} (${ev.status})`);
+        }
+        break;
+
+      case 'fetch_done':
+        setProgressPercent(30);
+        setStage(`fetch complete (${ev.tiles_fetched} ok, ${ev.tiles_skipped} ocean, ${ev.tiles_failed} failed)`);
+        break;
+
+      case 'splat_start':
+        setStatus('Running ITWOM propagation… (~60-120s)', 'busy');
+        setStage('splat: running');
+        // We can't get fine-grained splat progress in real time -- .NET's
+        // pipe redirector buffers splat's stdout until the process exits.
+        // Until we either rebuild splat with fflush or use a direct stdout
+        // reader, pulse the bar through this phase so the user sees "still
+        // working" instead of a stuck 30%.
+        setProgressIndet(true);
+        break;
+
+      case 'splat_progress':
+        // We only get a couple of these in practice (start and end of the
+        // run, due to the buffering). Use them just to switch back to a
+        // determinate bar when we hit the "writing_png" / done phases that
+        // do fire near the end.
+        if (ev.phase === 'writing_png' || ev.percent >= 90) {
+          setProgressIndet(false);
+          setProgressPercent(30 + ev.percent * 0.65);
+          setStage(`splat: ${ev.phase} ${ev.percent}%`);
+        } else if (ev.percent > 0) {
+          setProgressIndet(false);
+          setProgressPercent(30 + ev.percent * 0.65);
+          setStage(`splat: ${ev.phase} ${ev.percent}%`);
+        } else {
+          setStage(`splat: ${ev.phase}`);
+        }
+        break;
+
+      case 'done':
+        setProgressPercent(100);
+        setStage(`done in ${ev.elapsed_sec.toFixed(1)}s splat + ${ev.fetch_sec.toFixed(1)}s fetch`);
+        return { kind: 'done', event: ev };
+
+      case 'error':
+        setProgressIndet(false);
+        return { kind: 'error', event: ev };
+    }
+    return null;
+  }
+
   compBtn.addEventListener('click', async () => {
     if (txLat === null) return;
     const req = {
-      lat: txLat,
-      lon: txLon,
-      freq_mhz: +freqInp.value,
-      watts: +wattsInp.value,
+      lat: txLat, lon: txLon,
+      freq_mhz: +freqInp.value, watts: +wattsInp.value,
       gain_dbi: +gainInp.value,
       antenna_height_m: +heightInp.value,
       range_mi: +rangeInp.value,
@@ -254,27 +388,63 @@
     };
     compBtn.disabled = true;
     const t0 = performance.now();
-    setStatus('Computing coverage… (fetches SRTM tiles on demand; up to ~90s)', 'busy');
+    setStatus('Computing coverage…', 'busy');
+    showProgress(true);
+    setProgressIndet(true);
+    setProgressPercent(0);
+    setStage('starting');
+    startElapsedTimer(t0);
+
+    let terminal = null;
     try {
       const r = await fetch('/compute', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(req)
       });
-      const data = await r.json();
-      if (!data.ok) throw new Error(data.error || 'unknown error');
-      const t = Date.now();
-      const bounds = await loadOverlay(`live.png?t=${t}`, `live.geo?t=${t}`);
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+
+      // Read newline-delimited JSON events as they arrive.
+      const reader  = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer    = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // last item may be a partial line
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let ev;
+          try { ev = JSON.parse(line); }
+          catch (parseErr) { console.warn('bad event line:', line); continue; }
+          const t = applyEvent(ev);
+          if (t) terminal = t;
+        }
+      }
+
+      if (!terminal) throw new Error('stream ended without a done/error event');
+      if (terminal.kind === 'error') throw new Error(terminal.event.error || 'unknown error');
+
+      const ev = terminal.event;
+      const ts = Date.now();
+      const bounds = await loadOverlay(`live.png?t=${ts}`, `live.geo?t=${ts}`);
       map.fitBounds(bounds);
-      const dt = ((performance.now() - t0) / 1000).toFixed(1);
-      const fetchNote = data.tiles_fetched > 0
-        ? ` · fetched ${data.tiles_fetched} SRTM tile${data.tiles_fetched > 1 ? 's' : ''} (${data.fetch_sec.toFixed(1)}s)`
-        : (data.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
-      setStatus(`Done ${dt}s · splat ${data.elapsed_sec.toFixed(1)}s${fetchNote}`, 'ok');
+
+      const dtTotal = ((performance.now() - t0) / 1000).toFixed(1);
+      const fetchNote = ev.tiles_fetched > 0
+        ? ` · fetched ${ev.tiles_fetched} SRTM tile${ev.tiles_fetched > 1 ? 's' : ''} (${ev.fetch_sec.toFixed(1)}s)`
+        : (ev.tiles_needed > 0 ? ' · all SRTM tiles cached' : '');
+      setStatus(`Done ${dtTotal}s · splat ${ev.elapsed_sec.toFixed(1)}s${fetchNote}`, 'ok');
     } catch (e) {
       setStatus('FAIL: ' + e.message, 'err');
+      setStage('failed');
     } finally {
       compBtn.disabled = false;
+      stopElapsedTimer();
+      // Leave the progress bar visible briefly so the user sees the final 100%
+      setTimeout(() => showProgress(false), 1500);
     }
   });
 
