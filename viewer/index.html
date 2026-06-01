@@ -6,6 +6,11 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin="">
+<!-- Phase 21: KMZ/KML reference layers. markercluster handles dense files
+     (hundreds-to-thousands of placemarks) by collapsing nearby pins into a
+     numbered bubble when zoomed out. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <style>
   /* Phase 19c: VSCode-style icon rail + tabbed sidebar layout.
      Replaces the old single tall panel where every section was stacked on
@@ -300,6 +305,59 @@
     margin-top: 6px; max-width: 150px; border-top: 1px solid #2a2a2a; padding-top: 5px;
   }
   .splat-legend-quality b { color: #aaa; }
+
+  /* Phase 21: KMZ/KML reference layer cards in the Layers tab. Visually
+     parallels the Scenarios card so behaviour is predictable. */
+  .splat-layer-card {
+    border: 1px solid #333; border-radius: 4px;
+    background: #1d1d1d; padding: 7px 9px; margin-bottom: 6px;
+  }
+  .splat-layer-card .row1 {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
+  }
+  .splat-layer-card .swatch {
+    width: 14px; height: 14px; border-radius: 50%; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.3); flex-shrink: 0;
+  }
+  .splat-layer-card .name {
+    flex: 1; font-size: 11px; color: #fafafa; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .splat-layer-card .meta {
+    font-size: 10px; color: #888; line-height: 1.45; margin-bottom: 4px;
+  }
+  .splat-layer-card .row2 {
+    display: flex; align-items: center; gap: 6px; font-size: 11px;
+  }
+  .splat-layer-card .row2 label {
+    display: flex; align-items: center; gap: 4px;
+    color: #bbb; cursor: pointer; margin: 0; font-size: 11px;
+  }
+  .splat-layer-card button {
+    padding: 1px 6px; font-size: 10px; cursor: pointer;
+    background: #2a2a2a; color: #fafafa; border: 1px solid #3a3a3a;
+    border-radius: 3px;
+  }
+  .splat-layer-card button.del { color: #c66; border-color: #432; }
+
+  /* Override marker-cluster default look to match our dark theme. The base
+     stylesheet only colors clusters by size; we just darken the chrome a
+     touch and add a subtle border so they sit nicely on top of the
+     dark-theme coverage overlays. */
+  .marker-cluster-small  div { background: rgba(110, 220, 110, 0.85) !important; }
+  .marker-cluster-medium div { background: rgba(240, 200, 80, 0.85) !important; }
+  .marker-cluster-large  div { background: rgba(240, 110, 80, 0.85) !important; }
+  .marker-cluster-small,
+  .marker-cluster-medium,
+  .marker-cluster-large { background: transparent !important; }
+  .marker-cluster div  { color: #111; font-weight: 700; }
+  /* Each layer's individual markers are CSS-class-styled so we can drive
+     fill color from the layer's chosen palette index without inline styles
+     on every marker (faster + less DOM churn). */
+  .splat-pin {
+    border-radius: 50%; border: 1px solid rgba(0,0,0,0.5);
+    box-shadow: 0 0 2px rgba(0,0,0,0.6);
+  }
 </style>
 </head>
 <body>
@@ -310,8 +368,9 @@
     <button data-tab="tx"        class="active" title="Transmitter (Alt+1)">📡</button>
     <button data-tab="scenarios"                title="Scenarios (Alt+2)">📊<span class="badge" id="scenariosBadge" style="display:none;">0</span></button>
     <button data-tab="terrain"                  title="Terrain (Alt+3)">🗺️</button>
+    <button data-tab="layers"                   title="Reference layers (Alt+4)">📍<span class="badge" id="layersBadge" style="display:none;">0</span></button>
     <div class="spacer"></div>
-    <button data-tab="about" title="About (Alt+4)">ⓘ</button>
+    <button data-tab="about" title="About (Alt+5)">ⓘ</button>
     <button id="collapseBtn"  title="Collapse sidebar">◀</button>
   </aside>
 
@@ -438,6 +497,28 @@
       <div id="precacheProgress" class="splat-progress"><div class="fill"></div></div>
     </div>
 
+    <!-- ============== Reference Layers tab (Phase 21) ============== -->
+    <div class="tab" data-tab="layers">
+      <h2>Reference layers</h2>
+      <div class="tab-subtitle">
+        Drop in KMZ or KML files (repeater maps, tower lists, etc.) as
+        toggleable marker layers so you can see which points are inside
+        your computed coverage. Files are parsed in your browser; nothing
+        leaves your machine.
+      </div>
+
+      <h4>Add a file</h4>
+      <input type="file" id="layerFile" accept=".kmz,.kml" style="display:none">
+      <button id="layerFileBtn" class="primary">📂 Choose KMZ / KML file…</button>
+      <div style="font-size:10px;color:#888;margin-top:4px;">
+        Supports KML 2.x and KMZ (Google Earth / My Maps).
+        Multiple files can be loaded; each becomes a separate togglable layer.
+      </div>
+
+      <h4>Loaded layers</h4>
+      <div id="layerList" class="status">No reference layers loaded.</div>
+    </div>
+
     <!-- ============== About tab ============== -->
     <div class="tab" data-tab="about">
       <h2>EasyProp</h2>
@@ -495,7 +576,8 @@
 
       <h4>Keyboard shortcuts</h4>
       <div class="status" style="font-size:10px;line-height:1.55;">
-        Alt+1 / 2 / 3 / 4 &middot; switch tabs<br>
+        Alt+1 &middot; Transmitter &nbsp;&middot;&nbsp; Alt+2 &middot; Scenarios<br>
+        Alt+3 &middot; Terrain &nbsp;&middot;&nbsp; Alt+4 &middot; Layers &nbsp;&middot;&nbsp; Alt+5 &middot; About<br>
         Alt+B &middot; collapse / expand sidebar
       </div>
     </div>
@@ -508,6 +590,9 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
         crossorigin=""></script>
+<!-- Phase 21: KMZ ZIP unpacking + marker clustering (both CDN-loaded). -->
+<script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
 (async () => {
   const params  = new URLSearchParams(location.search);
@@ -683,7 +768,8 @@
     if (e.key === '1') { setActiveTab('tx');        e.preventDefault(); }
     if (e.key === '2') { setActiveTab('scenarios'); e.preventDefault(); }
     if (e.key === '3') { setActiveTab('terrain');   e.preventDefault(); }
-    if (e.key === '4') { setActiveTab('about');     e.preventDefault(); }
+    if (e.key === '4') { setActiveTab('layers');    e.preventDefault(); }
+    if (e.key === '5') { setActiveTab('about');     e.preventDefault(); }
     if (e.key === 'b' || e.key === 'B') { toggleSidebar(); e.preventDefault(); }
   });
   // Restore last-selected tab if any.
@@ -1189,6 +1275,351 @@
   });
   // Initial load
   refreshCompCache();
+
+  // ---------------- Reference layers (Phase 21) ----------------
+  // KMZ/KML import as togglable Leaflet marker layers. Files are parsed
+  // in-browser via JSZip + DOMParser (no upload, no server work). Parsed
+  // features + per-file UI state (name, color, visible, original file name)
+  // persist in localStorage so a reload doesn't require re-picking the
+  // file -- you just see your layers come back.
+  const LAYERS_KEY = 'easyprop.layers.v1';
+  const LAYER_PALETTE = ['#ff5252','#ffaa33','#33dd66','#4aa3ff','#c266ff','#ffd933','#00d0c4','#ff80b0'];
+  // Each layer entry:
+  //   { id, fileName, layerName, color (palette idx), shown, count, features:[
+  //       { kind:'point', lat, lon, name, description }
+  //       { kind:'line',  coords:[[lat,lon],...], name, description }
+  //       { kind:'poly',  coords:[[lat,lon],...], name, description }
+  //     ] }
+  const refLayerState = new Map();      // id -> entry above
+  const refClusters   = new Map();      // id -> L.markerClusterGroup
+  function loadRefLayersFromStorage() {
+    try {
+      const raw = localStorage.getItem(LAYERS_KEY);
+      if (!raw) return;
+      const arr = JSON.parse(raw);
+      for (const entry of arr) refLayerState.set(entry.id, entry);
+    } catch {}
+  }
+  function saveRefLayers() {
+    try {
+      const arr = [...refLayerState.values()];
+      localStorage.setItem(LAYERS_KEY, JSON.stringify(arr));
+    } catch (e) {
+      toast('Couldn\'t save layer state -- localStorage may be full.',
+            { kind:'warn', title:'Storage' });
+    }
+  }
+
+  // --- KML XML parser ---
+  // Pulls Placemark name + description + Point/LineString/Polygon coords
+  // out of a KML document. Tolerant of namespaces (most KML uses
+  // xmlns="http://www.opengis.net/kml/2.2") -- we go by local-name only
+  // via getElementsByTagName, which ignores namespace prefixes.
+  function parseKmlText(text) {
+    const doc = new DOMParser().parseFromString(text, 'text/xml');
+    const err = doc.querySelector('parsererror');
+    if (err) throw new Error('Malformed KML: ' + err.textContent.split('\n')[0]);
+
+    function textOf(el, tag) {
+      const t = el.getElementsByTagName(tag)[0];
+      return t ? t.textContent.trim() : '';
+    }
+    function parseCoords(text) {
+      // "lon,lat,alt lon,lat,alt ..." -- whitespace can be anywhere
+      const pts = [];
+      for (const tok of text.trim().split(/\s+/)) {
+        if (!tok) continue;
+        const parts = tok.split(',');
+        if (parts.length >= 2) {
+          const lon = +parts[0], lat = +parts[1];
+          if (isFinite(lon) && isFinite(lat)) pts.push([lat, lon]);
+        }
+      }
+      return pts;
+    }
+
+    const features = [];
+    const placemarks = doc.getElementsByTagName('Placemark');
+    for (const pm of placemarks) {
+      const name = textOf(pm, 'name') || 'Unnamed';
+      const description = textOf(pm, 'description') || '';
+      // Direct Point children
+      const pts = pm.getElementsByTagName('Point');
+      for (const p of pts) {
+        const c = parseCoords(textOf(p, 'coordinates'));
+        if (c.length) features.push({ kind:'point', lat: c[0][0], lon: c[0][1], name, description });
+      }
+      // LineStrings
+      const ls = pm.getElementsByTagName('LineString');
+      for (const l of ls) {
+        const c = parseCoords(textOf(l, 'coordinates'));
+        if (c.length >= 2) features.push({ kind:'line', coords: c, name, description });
+      }
+      // Polygons (outer ring only -- enough for "where is it" overlays)
+      const pgs = pm.getElementsByTagName('Polygon');
+      for (const pg of pgs) {
+        const outer = pg.getElementsByTagName('outerBoundaryIs')[0];
+        if (outer) {
+          const lr = outer.getElementsByTagName('LinearRing')[0];
+          if (lr) {
+            const c = parseCoords(textOf(lr, 'coordinates'));
+            if (c.length >= 3) features.push({ kind:'poly', coords: c, name, description });
+          }
+        }
+      }
+    }
+    // Document name -- nice default for the layer label
+    const docName = textOf(doc.documentElement, 'name') || '';
+    return { docName, features };
+  }
+
+  // --- KMZ unwrap (KMZ = zipped KML + optional asset images) ---
+  async function parseKmzFile(file) {
+    const zip = await JSZip.loadAsync(file);
+    // Convention: doc.kml at root, but some exports put it elsewhere.
+    let kmlEntry = zip.file(/^doc\.kml$/i)[0] || zip.file(/\.kml$/i)[0];
+    if (!kmlEntry) throw new Error('No .kml file inside the KMZ');
+    const text = await kmlEntry.async('text');
+    return parseKmlText(text);
+  }
+
+  async function importFile(file) {
+    const isKmz = /\.kmz$/i.test(file.name);
+    let parsed;
+    try {
+      parsed = isKmz ? await parseKmzFile(file)
+                     : parseKmlText(await file.text());
+    } catch (e) {
+      toast(e.message, { kind:'error', title:'Failed to parse ' + file.name });
+      return;
+    }
+    if (parsed.features.length === 0) {
+      toast('No placemarks found.', { kind:'warn', title: file.name });
+      return;
+    }
+    const id = 'lyr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,7);
+    const usedColors = new Set([...refLayerState.values()].map(s => s.color));
+    let color = 0;
+    for (let i = 0; i < LAYER_PALETTE.length; i++) {
+      if (!usedColors.has(i)) { color = i; break; }
+    }
+    const entry = {
+      id,
+      fileName : file.name,
+      layerName: parsed.docName || file.name.replace(/\.km[lz]$/i, ''),
+      color,
+      shown    : true,
+      count    : parsed.features.length,
+      features : parsed.features,
+    };
+    refLayerState.set(id, entry);
+    saveRefLayers();
+    buildClusterFor(id);
+    showRefLayer(id);
+    renderRefLayerList();
+    // Zoom-to-fit just-imported layer
+    fitToLayer(id);
+    toast(`${entry.layerName}: ${entry.count} feature${entry.count===1?'':'s'} loaded.`,
+          { kind:'info', title:'Layer added' });
+  }
+
+  function divIconFor(color) {
+    return L.divIcon({
+      className: '',
+      html: `<div class="splat-pin" style="width:11px;height:11px;background:${color};"></div>`,
+      iconSize: [11, 11],
+      iconAnchor: [6, 6],
+    });
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    })[c]);
+  }
+  // Pretty-print the typical pipe-separated KML description:
+  //   "Tone: / 141.3 | Owner: WRDU953 | County: New Castle"  ->  table-ish.
+  function formatDescription(desc) {
+    if (!desc) return '';
+    const trimmed = desc.trim();
+    // If it already looks like HTML, render as-is (sanitized: drop scripts/handlers).
+    if (/<\w+[^>]*>/.test(trimmed)) {
+      return trimmed.replace(/<script[\s\S]*?<\/script>/gi, '')
+                    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '');
+    }
+    // Otherwise: pipe-separated fields one per line, key:value bolded
+    return trimmed.split(/\s*\|\s*/).map(seg => {
+      const m = seg.match(/^([^:]{1,40}):\s*(.*)$/);
+      return m ? `<b>${escapeHtml(m[1])}</b>: ${escapeHtml(m[2])}` : escapeHtml(seg);
+    }).join('<br>');
+  }
+
+  function buildClusterFor(id) {
+    const entry = refLayerState.get(id);
+    if (!entry) return;
+    if (refClusters.has(id)) {
+      const old = refClusters.get(id);
+      if (map.hasLayer(old)) map.removeLayer(old);
+    }
+    const color = LAYER_PALETTE[entry.color];
+    const cluster = L.markerClusterGroup({
+      maxClusterRadius: 50, showCoverageOnHover: false,
+      spiderfyOnMaxZoom: true,
+      chunkedLoading: true,   // for big files (5k+ markers)
+    });
+    for (const f of entry.features) {
+      if (f.kind === 'point') {
+        const m = L.marker([f.lat, f.lon], { icon: divIconFor(color), title: f.name });
+        m.bindPopup(
+          `<b>${escapeHtml(f.name)}</b><br><span style="color:#666;font-size:11px;">${f.lat.toFixed(4)}, ${f.lon.toFixed(4)}</span>` +
+          (f.description ? `<hr style="margin:4px 0;border:none;border-top:1px solid #ddd;">${formatDescription(f.description)}` : ''),
+          { maxWidth: 320 });
+        cluster.addLayer(m);
+      } else if (f.kind === 'line') {
+        const ln = L.polyline(f.coords, { color, weight: 2, opacity: 0.8 });
+        if (f.name) ln.bindPopup(`<b>${escapeHtml(f.name)}</b>`);
+        cluster.addLayer(ln);
+      } else if (f.kind === 'poly') {
+        const pg = L.polygon(f.coords, { color, weight: 1, fillOpacity: 0.15 });
+        if (f.name) pg.bindPopup(`<b>${escapeHtml(f.name)}</b>`);
+        cluster.addLayer(pg);
+      }
+    }
+    refClusters.set(id, cluster);
+  }
+  function showRefLayer(id) {
+    const entry = refLayerState.get(id);
+    if (!entry) return;
+    entry.shown = true; saveRefLayers();
+    if (!refClusters.has(id)) buildClusterFor(id);
+    const c = refClusters.get(id);
+    if (c && !map.hasLayer(c)) c.addTo(map);
+    updateLayersBadge();
+  }
+  function hideRefLayer(id) {
+    const entry = refLayerState.get(id);
+    if (entry) { entry.shown = false; saveRefLayers(); }
+    const c = refClusters.get(id);
+    if (c && map.hasLayer(c)) map.removeLayer(c);
+    updateLayersBadge();
+  }
+  function fitToLayer(id) {
+    const entry = refLayerState.get(id);
+    if (!entry || !entry.features.length) return;
+    const lats = [], lons = [];
+    for (const f of entry.features) {
+      if (f.kind === 'point') { lats.push(f.lat); lons.push(f.lon); }
+      else if (f.coords) for (const [la, lo] of f.coords) { lats.push(la); lons.push(lo); }
+    }
+    if (lats.length) map.fitBounds([[Math.min(...lats), Math.min(...lons)],
+                                     [Math.max(...lats), Math.max(...lons)]],
+                                    { padding: [40, 40], maxZoom: 12 });
+  }
+  function deleteRefLayer(id) {
+    hideRefLayer(id);
+    refClusters.delete(id);
+    refLayerState.delete(id);
+    saveRefLayers();
+    renderRefLayerList();
+  }
+  function updateLayersBadge() {
+    const visible = [...refLayerState.values()].filter(e => e.shown).length;
+    const badge = document.getElementById('layersBadge');
+    if (visible > 0) { badge.style.display = ''; badge.textContent = visible; }
+    else             { badge.style.display = 'none'; }
+  }
+
+  function renderRefLayerList() {
+    const host = document.getElementById('layerList');
+    if (refLayerState.size === 0) {
+      host.innerHTML = '<span style="opacity:0.7;">No reference layers loaded.</span>';
+      updateLayersBadge();
+      return;
+    }
+    host.innerHTML = '';
+    host.classList.remove('status');
+    for (const entry of refLayerState.values()) {
+      host.appendChild(buildLayerCard(entry));
+    }
+    updateLayersBadge();
+  }
+  function buildLayerCard(entry) {
+    const card = document.createElement('div');
+    card.className = 'splat-layer-card';
+    const color = LAYER_PALETTE[entry.color];
+
+    const r1 = document.createElement('div'); r1.className = 'row1';
+    const sw = document.createElement('div');
+    sw.className = 'swatch';
+    sw.style.background = color;
+    sw.title = 'Click to cycle color';
+    sw.addEventListener('click', () => {
+      entry.color = (entry.color + 1) % LAYER_PALETTE.length;
+      saveRefLayers();
+      buildClusterFor(entry.id);
+      if (entry.shown) { showRefLayer(entry.id); }
+      renderRefLayerList();
+    });
+    const nm = document.createElement('div'); nm.className = 'name';
+    nm.textContent = entry.layerName;
+    nm.title = entry.fileName;
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '×';
+    del.title = 'Remove this layer';
+    del.addEventListener('click', () => deleteRefLayer(entry.id));
+    r1.appendChild(sw); r1.appendChild(nm); r1.appendChild(del);
+
+    const meta = document.createElement('div'); meta.className = 'meta';
+    meta.textContent = `${entry.count} feature${entry.count === 1 ? '' : 's'} · ${entry.fileName}`;
+
+    const r2 = document.createElement('div'); r2.className = 'row2';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = !!entry.shown;
+    cb.addEventListener('change', () => {
+      if (cb.checked) showRefLayer(entry.id); else hideRefLayer(entry.id);
+      renderRefLayerList();
+    });
+    const cbLabel = document.createElement('label');
+    cbLabel.appendChild(cb);
+    cbLabel.appendChild(document.createTextNode('Show'));
+
+    const fitBtn = document.createElement('button');
+    fitBtn.textContent = 'Zoom to';
+    fitBtn.title = 'Pan + zoom the map to fit this layer';
+    fitBtn.addEventListener('click', () => fitToLayer(entry.id));
+
+    r2.appendChild(cbLabel);
+    r2.appendChild(document.createElement('div')).style.flex = '1';
+    r2.appendChild(fitBtn);
+
+    card.appendChild(r1); card.appendChild(meta); card.appendChild(r2);
+    return card;
+  }
+
+  // --- Wire up the file picker ---
+  document.getElementById('layerFileBtn').addEventListener('click', () => {
+    document.getElementById('layerFile').click();
+  });
+  document.getElementById('layerFile').addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';   // allow re-picking the same file
+    if (file) await importFile(file);
+  });
+
+  // --- Restore from localStorage on page load ---
+  loadRefLayersFromStorage();
+  for (const entry of refLayerState.values()) {
+    buildClusterFor(entry.id);
+    if (entry.shown) showRefLayer(entry.id);
+  }
+  renderRefLayerList();
+  if (refLayerState.size > 0) {
+    const totalVisible = [...refLayerState.values()].filter(e => e.shown).length;
+    if (totalVisible > 0) {
+      toast(`${totalVisible} reference layer${totalVisible===1?'':'s'} restored.`,
+            { kind:'info', title:'Welcome back', durationMs: 3500,
+              hint:'Open 📍 Layers to manage them.' });
+    }
+  }
 
   // ---- Precache trigger (Phase 16b) ----
   // Streams NDJSON from /cache/precache the same way /compute does. As each
