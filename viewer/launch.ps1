@@ -419,6 +419,35 @@ function Invoke-PrecacheStreaming {
     }
 }
 
+function New-Thumbnail {
+    # Phase 23: downscale a cached coverage PNG into a small thumbnail
+    # used in the Scenarios panel cards. System.Drawing keeps this
+    # dependency-free (no ImageMagick install needed).
+    # ~80 px max dimension produces a 1-3 KB PNG that previews the
+    # coverage shape unambiguously.
+    param(
+        [string]$SrcPng,
+        [string]$DstPng,
+        [int]$MaxDim = 80
+    )
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    $src = [System.Drawing.Image]::FromFile($SrcPng)
+    try {
+        $r  = [math]::Min($MaxDim / [double]$src.Width, $MaxDim / [double]$src.Height)
+        $tw = [int][math]::Max(1, [math]::Round($src.Width  * $r))
+        $th = [int][math]::Max(1, [math]::Round($src.Height * $r))
+        $dst = New-Object System.Drawing.Bitmap $tw, $th
+        $g   = [System.Drawing.Graphics]::FromImage($dst)
+        try {
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $g.DrawImage($src, 0, 0, $tw, $th)
+        } finally { $g.Dispose() }
+        $dst.Save($DstPng, [System.Drawing.Imaging.ImageFormat]::Png)
+        $dst.Dispose()
+    } finally { $src.Dispose() }
+}
+
 function Build-ComputeCacheReport {
     # Phase 18: enumerate the compute cache (Phase 10's per-request png + geo
     # + json sidecars under $CacheDir). Returns a list of entries the viewer
@@ -435,17 +464,28 @@ function Build-ComputeCacheReport {
     $total = 0L
     foreach ($j in Get-ChildItem $Dir -Filter '*.json' -ErrorAction SilentlyContinue) {
         $key = $j.BaseName
+        if ($key -match '_thumb$') { continue }    # skip thumb sidecars if any sneak in
         $png = Join-Path $Dir "$key.png"
-        if (-not (Test-Path $png)) { continue }   # orphan sidecar, skip
+        if (-not (Test-Path $png)) { continue }    # orphan sidecar, skip
         $meta = $null
         try { $meta = Get-Content $j.FullName -Raw | ConvertFrom-Json } catch { continue }
         $pngLen = (Get-Item $png).Length
         $total += $pngLen
+        # Phase 23: lazy thumbnail backfill -- on first /cache/compute fetch
+        # after upgrade, generate thumbnails for any pre-existing entries
+        # that don't have one yet. ~50 ms per tile, one-time cost per cache.
+        $thumbName = "${key}_thumb.png"
+        $thumb     = Join-Path $Dir $thumbName
+        if (-not (Test-Path $thumb)) {
+            try   { New-Thumbnail -SrcPng $png -DstPng $thumb }
+            catch { } # non-fatal -- the card just won't show a preview
+        }
         $entries += @{
             key       = $key
             cached_at = "$($meta.cached_at)"
             png_bytes = $pngLen
             png_mb    = [math]::Round($pngLen / 1MB, 2)
+            thumb_url = if (Test-Path $thumb) { "/cache/compute/$thumbName" } else { $null }
             request   = $meta.request
         }
     }
@@ -475,8 +515,9 @@ function Remove-ComputeCacheEntry {
     # Defensive: reject anything that's not a plausible cache key.
     if ($Key -notmatch '^[a-fA-F0-9]+$') { return 0 }
     $removed = 0
-    foreach ($ext in 'png','geo','json') {
-        $p = Join-Path $Dir "$Key.$ext"
+    # Phase 23: also clean up the thumbnail sidecar.
+    foreach ($name in "$Key.png", "$Key.geo", "$Key.json", "${Key}_thumb.png") {
+        $p = Join-Path $Dir $name
         if (Test-Path $p) {
             try { Remove-Item $p -Force; $removed++ } catch {}
         }
@@ -840,12 +881,20 @@ function Copy-CacheTo {
 
 function Save-Cache {
     # After a successful compute, archive the live.* outputs into the cache
-    # so the next identical request becomes a hit.
+    # so the next identical request becomes a hit. Also writes a small
+    # thumbnail (Phase 23) for the Scenarios panel preview, and a JSON
+    # sidecar so a human (or a future cleanup script) can tell what each
+    # cached scenario actually was.
     param([string]$CacheDir, [string]$Key, [string]$ServeDir, [pscustomobject]$Req)
-    Copy-Item (Join-Path $ServeDir 'live.png') (Join-Path $CacheDir "$Key.png") -Force
+    $finalPng = Join-Path $CacheDir "$Key.png"
+    Copy-Item (Join-Path $ServeDir 'live.png') $finalPng -Force
     Copy-Item (Join-Path $ServeDir 'live.geo') (Join-Path $CacheDir "$Key.geo") -Force
-    # Also write a small JSON sidecar so a human (or a future cleanup script)
-    # can tell what each cached scenario actually was.
+    try {
+        New-Thumbnail -SrcPng $finalPng -DstPng (Join-Path $CacheDir "${Key}_thumb.png")
+    } catch {
+        # Non-fatal -- the scenarios card just won't show a preview; the
+        # next /cache/compute fetch will retry via the lazy-backfill path.
+    }
     $meta = [pscustomobject]@{
         schema    = $script:CACHE_SCHEMA
         key       = $Key
@@ -1255,9 +1304,10 @@ try {
                     try { & $emit @{ stage='error'; error=$_.Exception.Message } } catch {}
                 }
                 continue
-            } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -match '^/cache/compute/([a-fA-F0-9]+)\.(png|geo|json)$') {
+            } elseif ($req.HttpMethod -eq 'GET' -and $req.Url.LocalPath -match '^/cache/compute/([a-fA-F0-9]+(?:_thumb)?)\.(png|geo|json)$') {
                 # ---- /cache/compute/<key>.<ext> -- serve one cached file
                 # so each saved scenario can be its own overlay (Phase 18.5).
+                # Also serves <key>_thumb.png thumbnails for Phase 23.
                 # The router above only serves files from $serveDir; cached
                 # PNGs live in $CacheDir, so we need this dedicated route.
                 $key = $Matches[1]; $ext = $Matches[2]
