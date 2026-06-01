@@ -53,3 +53,5 @@ desktop.ini
 
 # Release artifacts (built by scripts/build_release.ps1, uploaded to GitHub Releases)
 EasyProp-win-*.zip
+installer/icon.ico
+EasyProp-Setup-*.exe
