@@ -358,6 +358,127 @@
     border-radius: 50%; border: 1px solid rgba(0,0,0,0.5);
     box-shadow: 0 0 2px rgba(0,0,0,0.6);
   }
+
+  /* Phase 21.2: user-added custom pins. divIcon-based so the colored
+     ring + emoji glyph stays crisp at every zoom. body.add-pin-mode
+     also retargets the map cursor so it's obvious which click will
+     drop the pin. */
+  .splat-custom-pin {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; line-height: 1;
+    border: 2px solid white;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.55);
+    cursor: pointer;
+  }
+  body.add-pin-mode .leaflet-container { cursor: crosshair !important; }
+
+  /* Pin-editor modal (open from "Add pin" or from a pin's Edit button).
+     A small centered overlay so it doesn't compete with the sidebar's
+     dark-on-dark theming. Backdrop dims the rest of the page so it's
+     clear the modal is the focus. */
+  .splat-pin-modal {
+    position: fixed; inset: 0; z-index: 1500;
+    background: rgba(0,0,0,0.55);
+    display: none; align-items: center; justify-content: center;
+  }
+  .splat-pin-modal.shown { display: flex; }
+  .splat-pin-modal-card {
+    background: #1f1f1f; color: #e0e0e0;
+    border: 1px solid #444; border-radius: 6px;
+    width: 360px; max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 60px); overflow-y: auto;
+    padding: 16px 18px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+  .splat-pin-modal-card h3 {
+    margin: 0 0 4px 0; font-size: 14px; font-weight: 600;
+  }
+  .splat-pin-modal-card h4 {
+    margin: 14px 0 6px 0; font-size: 10px; text-transform: uppercase;
+    color: #888; letter-spacing: 0.8px; font-weight: 600;
+  }
+  .splat-pin-modal-card .coord-line {
+    font-size: 11px; color: #888; margin-bottom: 8px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .splat-pin-modal-card label {
+    display: block; font-size: 11px; color: #aaa; margin-top: 8px;
+  }
+  .splat-pin-modal-card input[type="text"],
+  .splat-pin-modal-card textarea {
+    width: 100%; box-sizing: border-box; margin-top: 3px;
+    padding: 6px 8px; font-size: 12px; font-family: inherit;
+    background: #0f0f0f; color: #fafafa;
+    border: 1px solid #2a2a2a; border-radius: 3px; resize: vertical;
+  }
+  .splat-pin-modal-card input:focus,
+  .splat-pin-modal-card textarea:focus { border-color: #4aa3ff; outline: none; }
+  .splat-pin-modal-card .icon-grid {
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px;
+  }
+  .splat-pin-modal-card .icon-cat {
+    grid-column: 1 / -1; font-size: 9px; color: #777;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    margin-top: 6px; margin-bottom: 1px;
+  }
+  .splat-pin-modal-card .icon-cat:first-child { margin-top: 0; }
+  .splat-pin-modal-card .icon-btn {
+    background: #161616; border: 1px solid #2a2a2a;
+    border-radius: 3px; padding: 5px 0;
+    font-size: 16px; line-height: 1; cursor: pointer;
+    text-align: center; color: #fff;
+  }
+  .splat-pin-modal-card .icon-btn:hover { background: #222; }
+  .splat-pin-modal-card .icon-btn.selected {
+    border-color: #4aa3ff; background: #1d2a3a;
+  }
+  .splat-pin-modal-card .color-row {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .splat-pin-modal-card .color-btn {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 2px solid transparent; cursor: pointer;
+  }
+  .splat-pin-modal-card .color-btn.selected {
+    border-color: #fff;
+    box-shadow: 0 0 0 1px #000;
+  }
+  .splat-pin-modal-card .modal-buttons {
+    display: flex; gap: 8px; margin-top: 14px;
+  }
+  .splat-pin-modal-card .modal-buttons button {
+    flex: 1; padding: 7px 10px; font-size: 12px;
+    background: #2a2a2a; color: #fafafa;
+    border: 1px solid #3a3a3a; border-radius: 3px;
+    cursor: pointer;
+  }
+  .splat-pin-modal-card .modal-buttons button.primary {
+    background: #2c7a4a; border-color: #2c7a4a; font-weight: 600;
+  }
+  .splat-pin-modal-card .modal-buttons button.danger {
+    background: #5a2020; border-color: #5a2020; color: #fff;
+  }
+  /* Compact list of user pins in the Layers tab */
+  .splat-mypin-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 0; border-bottom: 1px solid #262626;
+    font-size: 11px;
+  }
+  .splat-mypin-row:last-child { border-bottom: none; }
+  .splat-mypin-row .glyph {
+    width: 22px; height: 22px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 13px; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.2);
+  }
+  .splat-mypin-row .label { flex: 1; color: #ddd; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .splat-mypin-row button {
+    padding: 1px 6px; font-size: 10px; cursor: pointer;
+    background: #2a2a2a; color: #fafafa; border: 1px solid #3a3a3a;
+    border-radius: 3px;
+  }
+  .splat-mypin-row button.del { color: #c66; border-color: #432; }
 </style>
 </head>
 <body>
@@ -501,15 +622,25 @@
     <div class="tab" data-tab="layers">
       <h2>Reference layers</h2>
       <div class="tab-subtitle">
-        Drop in KMZ or KML files (repeater maps, tower lists, etc.) as
-        toggleable marker layers so you can see which points are inside
-        your computed coverage. Files are parsed in your browser; nothing
-        leaves your machine.
+        Drop your own pins for notable spots, and/or import KMZ/KML files
+        (repeater maps, tower lists). Both stay on the map so you can see
+        which points fall inside your coverage. Everything is parsed and
+        stored in your browser; nothing leaves your machine.
       </div>
 
-      <h4>Add a file</h4>
+      <h4>My pins</h4>
+      <button id="addCustomPinBtn" class="primary">+ Add a pin</button>
+      <div style="font-size:10px;color:#888;margin-top:4px;">
+        Click the button, then click anywhere on the map to drop a pin
+        with a custom icon and notes.
+      </div>
+      <div id="customPinList" class="status" style="margin-top:8px;">
+        No pins yet.
+      </div>
+
+      <h4>Import KMZ / KML</h4>
       <input type="file" id="layerFile" accept=".kmz,.kml" style="display:none">
-      <button id="layerFileBtn" class="primary">📂 Choose KMZ / KML file…</button>
+      <button id="layerFileBtn">📂 Choose KMZ / KML file…</button>
       <div style="font-size:10px;color:#888;margin-top:4px;">
         Supports KML 2.x and KMZ (Google Earth / My Maps).
         Multiple files can be loaded; each becomes a separate togglable layer.
@@ -585,6 +716,32 @@
   </section>
 
   <div id="map"></div>
+</div>
+
+<!-- Phase 21.2: pin editor modal. Hidden by default; .shown class opens
+     it. JS at the bottom of the script wires up icon/color selection,
+     save/cancel, and delete (when editing an existing pin). -->
+<div id="pinModal" class="splat-pin-modal" tabindex="-1">
+  <div class="splat-pin-modal-card">
+    <h3 id="pinModalTitle">New pin</h3>
+    <div class="coord-line" id="pinModalCoords">—</div>
+
+    <label>Name <input id="pinModalName" type="text" maxlength="80" placeholder="e.g. Local repeater 146.52"></label>
+
+    <h4>Icon</h4>
+    <div class="icon-grid" id="pinModalIcons"></div>
+
+    <h4>Color</h4>
+    <div class="color-row" id="pinModalColors"></div>
+
+    <label>Notes <textarea id="pinModalNote" rows="4" maxlength="2000" placeholder="Frequency / tone / owner / anything you want to remember…"></textarea></label>
+
+    <div class="modal-buttons">
+      <button id="pinModalDelete" class="danger" style="display:none;">Delete</button>
+      <button id="pinModalCancel">Cancel</button>
+      <button id="pinModalSave" class="primary">Save pin</button>
+    </div>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -1779,6 +1936,292 @@
               hint:'Open 📍 Layers to manage them.' });
     }
   }
+
+  // ---------------- User-added custom pins (Phase 21.2) ----------------
+  // Click "Add a pin" -> map enters add-pin mode -> next map click opens
+  // the pin-editor modal pre-filled with the clicked lat/lon. Pins persist
+  // to localStorage like all other UI state.
+  //
+  // The icon library is plain emoji rather than a glyph font / SVG sprite:
+  //   - zero extra HTTP fetches, zero asset to ship
+  //   - looks right on every modern desktop OS
+  //   - extensible by just adding a string to the array
+  // For users who want a non-emoji look, the colored background ring still
+  // dominates visually so the marker reads at a glance even when the glyph
+  // is rendered in a slightly different font.
+  const CUSTOM_PINS_KEY = 'easyprop.customPins.v1';
+  const PIN_ICON_CATS = [
+    { label: 'Comms',     icons: ['📡','🗼','📻','📞','🛰️','📶'] },
+    { label: 'Buildings', icons: ['🏠','🏢','🏛️','🏥','⛪','🏫','🏭'] },
+    { label: 'Transport', icons: ['🚗','🚁','✈️','🚉','⛴️','🚲'] },
+    { label: 'Utility',   icons: ['⛽','🔋','⚡','💧','🔥'] },
+    { label: 'Markers',   icons: ['📍','⭐','❗','⚠️','🚩','❤️','🎯','📷'] },
+  ];
+  const PIN_COLORS = ['#ff5252','#ffaa33','#ffd933','#33dd66','#4aa3ff','#c266ff','#f5f5f5','#666666'];
+  const customPins      = new Map();      // id -> pin object
+  const customPinLayer  = L.layerGroup(); // single layer (no clustering -- usually few)
+  customPinLayer.addTo(map);
+  let   addPinMode      = false;
+  let   editingPinId    = null;
+  let   modalLatLon     = null;
+  let   modalSelIcon    = '📡';
+  let   modalSelColor   = PIN_COLORS[4];
+
+  function loadCustomPins() {
+    try {
+      const raw = localStorage.getItem(CUSTOM_PINS_KEY);
+      if (!raw) return;
+      for (const p of JSON.parse(raw)) customPins.set(p.id, p);
+    } catch {}
+  }
+  function saveCustomPins() {
+    try {
+      localStorage.setItem(CUSTOM_PINS_KEY, JSON.stringify([...customPins.values()]));
+    } catch {
+      toast('Couldn\'t save pins — localStorage may be full.',
+            { kind:'warn', title:'Storage' });
+    }
+  }
+  function escapeHtmlInline(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    })[c]);
+  }
+  function makePinMarker(pin) {
+    const html =
+      `<div class="splat-custom-pin" style="background:${escapeHtmlInline(pin.color)};">` +
+        `<span>${escapeHtmlInline(pin.icon)}</span>` +
+      `</div>`;
+    const icon = L.divIcon({
+      className: '',
+      html,
+      iconSize:    [28, 28],
+      iconAnchor:  [14, 14],
+      popupAnchor: [0, -14],
+    });
+    const m = L.marker([pin.lat, pin.lon], { icon, title: pin.name, draggable: false });
+    const popupHtml = (() => {
+      const noteHtml = pin.note
+        ? `<div style="margin-top:4px;white-space:pre-wrap;color:#333;font-size:12px;">${escapeHtmlInline(pin.note)}</div>`
+        : '';
+      return `<div style="min-width:180px;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span style="font-size:18px;">${escapeHtmlInline(pin.icon)}</span>
+          <b>${escapeHtmlInline(pin.name)}</b>
+        </div>
+        <div style="font-size:11px;color:#666;font-family:ui-monospace,Consolas,monospace;">
+          ${pin.lat.toFixed(4)}, ${pin.lon.toFixed(4)}
+        </div>
+        ${noteHtml}
+        <div style="margin-top:8px;display:flex;gap:6px;">
+          <button data-pin-edit="${pin.id}"   style="font-size:11px;padding:3px 8px;cursor:pointer;">Edit</button>
+          <button data-pin-delete="${pin.id}" style="font-size:11px;padding:3px 8px;cursor:pointer;color:#c44;">Delete</button>
+        </div>
+      </div>`;
+    })();
+    m.bindPopup(popupHtml, { maxWidth: 280 });
+    m._pinId = pin.id;
+    return m;
+  }
+  function rebuildCustomPinLayer() {
+    customPinLayer.clearLayers();
+    for (const p of customPins.values()) makePinMarker(p).addTo(customPinLayer);
+  }
+  // Popup buttons -- delegated, since the popup HTML lives outside our
+  // normal DOM. We listen on the map's container which catches every
+  // popup-button click.
+  map.getContainer().addEventListener('click', (e) => {
+    const ed = e.target.closest('[data-pin-edit]');
+    const dl = e.target.closest('[data-pin-delete]');
+    if (ed) {
+      const id = ed.getAttribute('data-pin-edit');
+      const pin = customPins.get(id);
+      if (pin) { map.closePopup(); openPinModal(pin); }
+    } else if (dl) {
+      const id = dl.getAttribute('data-pin-delete');
+      if (confirm('Delete this pin?')) {
+        customPins.delete(id);
+        saveCustomPins();
+        rebuildCustomPinLayer();
+        renderCustomPinList();
+        map.closePopup();
+      }
+    }
+  });
+
+  function toggleAddPinMode(on) {
+    addPinMode = !!on;
+    document.body.classList.toggle('add-pin-mode', addPinMode);
+    const btn = document.getElementById('addCustomPinBtn');
+    btn.textContent = addPinMode ? '✕ Cancel placement' : '+ Add a pin';
+    btn.classList.toggle('active', addPinMode);
+    if (addPinMode) {
+      toast('Click anywhere on the map to drop a pin.',
+            { kind:'info', durationMs: 3500, title:'Add a pin' });
+    }
+  }
+  document.getElementById('addCustomPinBtn').addEventListener('click', () => {
+    toggleAddPinMode(!addPinMode);
+  });
+  map.on('click', (e) => {
+    if (!addPinMode) return;
+    toggleAddPinMode(false);
+    openPinModal({ lat: e.latlng.lat, lon: e.latlng.lng });
+  });
+
+  // --- Modal ---
+  const pinModalEl    = document.getElementById('pinModal');
+  const pinModalTitle = document.getElementById('pinModalTitle');
+  const pinModalCoords= document.getElementById('pinModalCoords');
+  const pinModalName  = document.getElementById('pinModalName');
+  const pinModalNote  = document.getElementById('pinModalNote');
+  const pinModalIcons = document.getElementById('pinModalIcons');
+  const pinModalColors= document.getElementById('pinModalColors');
+  const pinModalSave  = document.getElementById('pinModalSave');
+  const pinModalCancel= document.getElementById('pinModalCancel');
+  const pinModalDelete= document.getElementById('pinModalDelete');
+
+  function renderIconGrid() {
+    pinModalIcons.innerHTML = '';
+    for (const cat of PIN_ICON_CATS) {
+      const h = document.createElement('div');
+      h.className = 'icon-cat'; h.textContent = cat.label;
+      pinModalIcons.appendChild(h);
+      for (const ic of cat.icons) {
+        const b = document.createElement('div');
+        b.className = 'icon-btn'; b.textContent = ic; b.dataset.icon = ic;
+        if (ic === modalSelIcon) b.classList.add('selected');
+        b.addEventListener('click', () => {
+          modalSelIcon = ic;
+          pinModalIcons.querySelectorAll('.icon-btn').forEach(x => x.classList.toggle('selected', x.dataset.icon === ic));
+        });
+        pinModalIcons.appendChild(b);
+      }
+    }
+  }
+  function renderColorRow() {
+    pinModalColors.innerHTML = '';
+    for (const c of PIN_COLORS) {
+      const b = document.createElement('div');
+      b.className = 'color-btn'; b.style.background = c; b.dataset.color = c;
+      if (c === modalSelColor) b.classList.add('selected');
+      b.addEventListener('click', () => {
+        modalSelColor = c;
+        pinModalColors.querySelectorAll('.color-btn').forEach(x => x.classList.toggle('selected', x.dataset.color === c));
+      });
+      pinModalColors.appendChild(b);
+    }
+  }
+  function openPinModal(initial) {
+    editingPinId  = initial.id || null;
+    modalLatLon   = { lat: initial.lat, lon: initial.lon };
+    modalSelIcon  = initial.icon  || '📡';
+    modalSelColor = initial.color || PIN_COLORS[4];
+    pinModalTitle.textContent  = editingPinId ? 'Edit pin' : 'New pin';
+    pinModalCoords.textContent = `${initial.lat.toFixed(4)}, ${initial.lon.toFixed(4)}`;
+    pinModalName.value = initial.name || '';
+    pinModalNote.value = initial.note || '';
+    pinModalDelete.style.display = editingPinId ? '' : 'none';
+    renderIconGrid();
+    renderColorRow();
+    pinModalEl.classList.add('shown');
+    setTimeout(() => pinModalName.focus(), 30);
+  }
+  function closePinModal() {
+    pinModalEl.classList.remove('shown');
+    editingPinId = null; modalLatLon = null;
+  }
+  pinModalCancel.addEventListener('click', closePinModal);
+  pinModalEl.addEventListener('click', (e) => {
+    if (e.target === pinModalEl) closePinModal();   // click backdrop dismisses
+  });
+  document.addEventListener('keydown', (e) => {
+    if (!pinModalEl.classList.contains('shown')) return;
+    if (e.key === 'Escape') closePinModal();
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) pinModalSave.click();
+  });
+  pinModalDelete.addEventListener('click', () => {
+    if (!editingPinId) return;
+    if (!confirm('Delete this pin?')) return;
+    customPins.delete(editingPinId);
+    saveCustomPins();
+    rebuildCustomPinLayer();
+    renderCustomPinList();
+    closePinModal();
+  });
+  pinModalSave.addEventListener('click', () => {
+    if (!modalLatLon) return;
+    const name = (pinModalName.value || '').trim() || 'Untitled';
+    const note = (pinModalNote.value || '').trim();
+    if (editingPinId) {
+      const p = customPins.get(editingPinId);
+      if (p) {
+        p.name = name; p.note = note;
+        p.icon = modalSelIcon; p.color = modalSelColor;
+      }
+    } else {
+      const id = 'pin_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,7);
+      customPins.set(id, {
+        id, lat: modalLatLon.lat, lon: modalLatLon.lon,
+        name, note, icon: modalSelIcon, color: modalSelColor,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    saveCustomPins();
+    rebuildCustomPinLayer();
+    renderCustomPinList();
+    closePinModal();
+  });
+
+  // --- List of pins in the Layers tab ---
+  const customPinListEl = document.getElementById('customPinList');
+  function renderCustomPinList() {
+    if (customPins.size === 0) {
+      customPinListEl.innerHTML = 'No pins yet.';
+      customPinListEl.classList.add('status');
+      return;
+    }
+    customPinListEl.classList.remove('status');
+    customPinListEl.innerHTML = '';
+    const sorted = [...customPins.values()].sort((a, b) =>
+      (b.createdAt || '').localeCompare(a.createdAt || ''));
+    for (const p of sorted) {
+      const row = document.createElement('div');
+      row.className = 'splat-mypin-row';
+      const g = document.createElement('span');
+      g.className = 'glyph'; g.style.background = p.color; g.textContent = p.icon;
+      const lbl = document.createElement('span');
+      lbl.className = 'label';
+      lbl.textContent = p.name;
+      lbl.title = `${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}` + (p.note ? '\n' + p.note : '');
+      lbl.addEventListener('click', () => {
+        map.setView([p.lat, p.lon], Math.max(map.getZoom(), 13));
+        const m = [...customPinLayer.getLayers()].find(x => x._pinId === p.id);
+        if (m) m.openPopup();
+      });
+      const ed = document.createElement('button');
+      ed.textContent = 'Edit';
+      ed.addEventListener('click', () => openPinModal(p));
+      const dl = document.createElement('button');
+      dl.className = 'del'; dl.textContent = '×';
+      dl.title = 'Delete this pin';
+      dl.addEventListener('click', () => {
+        if (confirm('Delete "' + p.name + '"?')) {
+          customPins.delete(p.id);
+          saveCustomPins();
+          rebuildCustomPinLayer();
+          renderCustomPinList();
+        }
+      });
+      row.appendChild(g); row.appendChild(lbl); row.appendChild(ed); row.appendChild(dl);
+      customPinListEl.appendChild(row);
+    }
+  }
+
+  // --- Init ---
+  loadCustomPins();
+  rebuildCustomPinLayer();
+  renderCustomPinList();
 
   // ---- Precache trigger (Phase 16b) ----
   // Streams NDJSON from /cache/precache the same way /compute does. As each
