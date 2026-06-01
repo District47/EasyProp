@@ -1312,9 +1312,11 @@
 
   // --- KML XML parser ---
   // Pulls Placemark name + description + Point/LineString/Polygon coords
-  // out of a KML document. Tolerant of namespaces (most KML uses
-  // xmlns="http://www.opengis.net/kml/2.2") -- we go by local-name only
-  // via getElementsByTagName, which ignores namespace prefixes.
+  // out of a KML document, AND collects the file's <Style> / <StyleMap>
+  // definitions so we can render each placemark with its original (often
+  // custom-uploaded) icon instead of a generic colored dot. Tolerant of
+  // namespaces (most KML uses xmlns="http://www.opengis.net/kml/2.2") --
+  // we go by local-name only via getElementsByTagName.
   function parseKmlText(text) {
     const doc = new DOMParser().parseFromString(text, 'text/xml');
     const err = doc.querySelector('parsererror');
@@ -1338,22 +1340,68 @@
       return pts;
     }
 
+    // Phase 21.1: extract <Style> / <StyleMap> definitions so the renderer
+    // can honor the KMZ's original (often custom-uploaded) icons rather
+    // than substituting a generic colored dot. Stored as plain objects
+    // (not Maps) so the whole thing round-trips through localStorage.
+    //
+    // styles[id]    = { iconHref, scale, hsX, hsY, hsXu, hsYu }
+    // styleMaps[id] = "normalStyleId"
+    const styles    = {};
+    const styleMaps = {};
+    for (const s of doc.getElementsByTagName('Style')) {
+      const id = s.getAttribute('id');
+      if (!id) continue;
+      const iconStyle = s.getElementsByTagName('IconStyle')[0];
+      if (!iconStyle) continue;
+      const icon = iconStyle.getElementsByTagName('Icon')[0];
+      if (!icon) continue;
+      const href = textOf(icon, 'href');
+      if (!href) continue;
+      const scaleNode = iconStyle.getElementsByTagName('scale')[0];
+      const scale = scaleNode ? +scaleNode.textContent : 1;
+      let hsX = 0.5, hsY = 0.5, hsXu = 'fraction', hsYu = 'fraction';
+      const hs = iconStyle.getElementsByTagName('hotSpot')[0];
+      if (hs) {
+        const px = parseFloat(hs.getAttribute('x'));
+        const py = parseFloat(hs.getAttribute('y'));
+        if (isFinite(px)) hsX = px;
+        if (isFinite(py)) hsY = py;
+        hsXu = hs.getAttribute('xunits') || 'fraction';
+        hsYu = hs.getAttribute('yunits') || 'fraction';
+      }
+      styles[id] = { iconHref: href, scale, hsX, hsY, hsXu, hsYu };
+    }
+    for (const sm of doc.getElementsByTagName('StyleMap')) {
+      const id = sm.getAttribute('id');
+      if (!id) continue;
+      for (const pair of sm.getElementsByTagName('Pair')) {
+        const key = textOf(pair, 'key');
+        const su  = textOf(pair, 'styleUrl');
+        if (key === 'normal' && su) {
+          styleMaps[id] = su.replace(/^#/, '');
+          break;
+        }
+      }
+    }
+
     const features = [];
     const placemarks = doc.getElementsByTagName('Placemark');
     for (const pm of placemarks) {
       const name = textOf(pm, 'name') || 'Unnamed';
       const description = textOf(pm, 'description') || '';
+      const styleUrl    = textOf(pm, 'styleUrl');   // e.g. "#icon-1529-9C27B0"
       // Direct Point children
       const pts = pm.getElementsByTagName('Point');
       for (const p of pts) {
         const c = parseCoords(textOf(p, 'coordinates'));
-        if (c.length) features.push({ kind:'point', lat: c[0][0], lon: c[0][1], name, description });
+        if (c.length) features.push({ kind:'point', lat: c[0][0], lon: c[0][1], name, description, styleUrl });
       }
       // LineStrings
       const ls = pm.getElementsByTagName('LineString');
       for (const l of ls) {
         const c = parseCoords(textOf(l, 'coordinates'));
-        if (c.length >= 2) features.push({ kind:'line', coords: c, name, description });
+        if (c.length >= 2) features.push({ kind:'line', coords: c, name, description, styleUrl });
       }
       // Polygons (outer ring only -- enough for "where is it" overlays)
       const pgs = pm.getElementsByTagName('Polygon');
@@ -1363,24 +1411,70 @@
           const lr = outer.getElementsByTagName('LinearRing')[0];
           if (lr) {
             const c = parseCoords(textOf(lr, 'coordinates'));
-            if (c.length >= 3) features.push({ kind:'poly', coords: c, name, description });
+            if (c.length >= 3) features.push({ kind:'poly', coords: c, name, description, styleUrl });
           }
         }
       }
     }
     // Document name -- nice default for the layer label
     const docName = textOf(doc.documentElement, 'name') || '';
-    return { docName, features };
+    return { docName, features, styles, styleMaps };
+  }
+
+  // Walk a styleUrl through StyleMaps (-> Style) and return the icon spec.
+  function resolveStyle(styleUrl, styles, styleMaps) {
+    if (!styleUrl || !styles) return null;
+    let id = styleUrl.replace(/^#/, '');
+    // Follow up to 5 redirects to avoid pathological loops
+    for (let i = 0; i < 5 && styleMaps && styleMaps[id]; i++) {
+      id = styleMaps[id].replace(/^#/, '');
+    }
+    return styles[id] || null;
   }
 
   // --- KMZ unwrap (KMZ = zipped KML + optional asset images) ---
+  // Phase 21.1: also pull the referenced icon images out of the ZIP and
+  // convert them to data URLs so L.icon can use them directly without any
+  // additional HTTP fetches (and so the icons round-trip through
+  // localStorage with the rest of the layer).
   async function parseKmzFile(file) {
     const zip = await JSZip.loadAsync(file);
     // Convention: doc.kml at root, but some exports put it elsewhere.
     let kmlEntry = zip.file(/^doc\.kml$/i)[0] || zip.file(/\.kml$/i)[0];
     if (!kmlEntry) throw new Error('No .kml file inside the KMZ');
-    const text = await kmlEntry.async('text');
-    return parseKmlText(text);
+    const text   = await kmlEntry.async('text');
+    const parsed = parseKmlText(text);
+
+    // Collect every iconHref any <Style> uses, then extract that file from
+    // the ZIP. Skips remote URLs (http(s)://) -- those are usable directly
+    // as L.icon iconUrl, no extraction needed.
+    const wanted = new Set();
+    for (const s of Object.values(parsed.styles || {})) {
+      if (s.iconHref && !/^https?:\/\//i.test(s.iconHref)) wanted.add(s.iconHref);
+    }
+    const iconUrls = {};   // href (as-written) -> data URL
+    for (const href of wanted) {
+      // Try a few normalizations the KML might use vs the ZIP's actual paths.
+      let entry = zip.file(href);
+      if (!entry) entry = zip.file(href.replace(/^\.?\//, ''));
+      if (!entry) {
+        // Last-resort: match by filename inside ZIP regardless of path
+        const base = href.split('/').pop();
+        const candidates = zip.file(new RegExp('(^|/)' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i'));
+        if (candidates && candidates.length) entry = candidates[0];
+      }
+      if (!entry) continue;
+      const blob = await entry.async('blob');
+      const dataUrl = await new Promise((res, rej) => {
+        const fr = new FileReader();
+        fr.onload  = () => res(fr.result);
+        fr.onerror = () => rej(new Error('Failed to read icon ' + href));
+        fr.readAsDataURL(blob);
+      });
+      iconUrls[href] = dataUrl;
+    }
+    parsed.iconUrls = iconUrls;
+    return parsed;
   }
 
   async function importFile(file) {
@@ -1411,6 +1505,11 @@
       shown    : true,
       count    : parsed.features.length,
       features : parsed.features,
+      // Phase 21.1: honor the KMZ's original pin icons
+      styles    : parsed.styles    || {},
+      styleMaps : parsed.styleMaps || {},
+      iconUrls  : parsed.iconUrls  || {},   // href -> data URL (empty for KML files using only remote URLs)
+      useOriginalIcons: true,
     };
     refLayerState.set(id, entry);
     saveRefLayers();
@@ -1466,9 +1565,42 @@
       spiderfyOnMaxZoom: true,
       chunkedLoading: true,   // for big files (5k+ markers)
     });
+
+    // Phase 21.1: try to honor each placemark's original icon.
+    // - point f.styleUrl  ->  resolveStyle  ->  iconHref
+    // - iconHref looked up in entry.iconUrls (KMZ blob -> data URL) or used
+    //   directly if it's already an http(s) URL.
+    // - L.icon with iconSize derived from the KML <scale> (default 28 px).
+    // Falls back to the colored divIcon when nothing matches OR when the
+    // user has toggled the original icons off.
+    function iconForPoint(f) {
+      if (!entry.useOriginalIcons) return divIconFor(color);
+      const style = resolveStyle(f.styleUrl, entry.styles, entry.styleMaps);
+      if (!style) return divIconFor(color);
+      let url = null;
+      if (/^https?:\/\//i.test(style.iconHref)) url = style.iconHref;
+      else if (entry.iconUrls[style.iconHref])  url = entry.iconUrls[style.iconHref];
+      if (!url) return divIconFor(color);
+      const base = 28;                       // px at scale=1
+      const sz   = Math.round(base * (style.scale || 1));
+      // KML default hotSpot anchors at the icon's center for most MyMaps
+      // exports; for hsXu/hsYu = "fraction" we can compute the anchor in
+      // pixels. If absent, [sz/2, sz/2] is the closest universal default.
+      let ax = sz / 2, ay = sz / 2;
+      if (style.hsXu === 'fraction') ax = sz * style.hsX;
+      if (style.hsYu === 'fraction') ay = sz * (1 - style.hsY);   // KML y is from bottom
+      return L.icon({
+        iconUrl: url,
+        iconSize:    [sz, sz],
+        iconAnchor:  [ax, ay],
+        popupAnchor: [0, -ay],
+      });
+    }
+
     for (const f of entry.features) {
       if (f.kind === 'point') {
-        const m = L.marker([f.lat, f.lon], { icon: divIconFor(color), title: f.name });
+        const icon = iconForPoint(f);
+        const m = L.marker([f.lat, f.lon], { icon, title: f.name });
         m.bindPopup(
           `<b>${escapeHtml(f.name)}</b><br><span style="color:#666;font-size:11px;">${f.lat.toFixed(4)}, ${f.lon.toFixed(4)}</span>` +
           (f.description ? `<hr style="margin:4px 0;border:none;border-top:1px solid #ddd;">${formatDescription(f.description)}` : ''),
@@ -1590,6 +1722,33 @@
     r2.appendChild(cbLabel);
     r2.appendChild(document.createElement('div')).style.flex = '1';
     r2.appendChild(fitBtn);
+
+    // Phase 21.1: original-icons toggle. Only shown if the layer actually
+    // has style info parsed -- there's no point offering the toggle on a
+    // plain KML with no <Style> blocks (nothing to fall back from / to).
+    const haveOriginals = (Object.keys(entry.styles || {}).length > 0) &&
+      (Object.keys(entry.iconUrls || {}).length > 0 ||
+       Object.values(entry.styles || {}).some(s => /^https?:\/\//i.test(s.iconHref || '')));
+    if (haveOriginals) {
+      const r3 = document.createElement('div'); r3.className = 'row2';
+      r3.style.marginTop = '4px';
+      const oiCb = document.createElement('input');
+      oiCb.type = 'checkbox';
+      oiCb.checked = !!entry.useOriginalIcons;
+      oiCb.title = 'Use the KMZ file\'s original pin icons (uncheck for plain colored dots in this layer\'s color)';
+      oiCb.addEventListener('change', () => {
+        entry.useOriginalIcons = oiCb.checked;
+        saveRefLayers();
+        buildClusterFor(entry.id);
+        if (entry.shown) showRefLayer(entry.id);
+      });
+      const oiLabel = document.createElement('label');
+      oiLabel.appendChild(oiCb);
+      oiLabel.appendChild(document.createTextNode('Use original KMZ icons'));
+      r3.appendChild(oiLabel);
+      card.appendChild(r1); card.appendChild(meta); card.appendChild(r2); card.appendChild(r3);
+      return card;
+    }
 
     card.appendChild(r1); card.appendChild(meta); card.appendChild(r2);
     return card;
