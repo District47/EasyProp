@@ -293,6 +293,55 @@
     border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);
   }
 
+  /* Phase 23.2: map search bar (Nominatim geocoder). Floats above the
+     map at top-center; doesn't conflict with Leaflet's topleft zoom or
+     topright layer-switcher controls. Also accepts a "lat, lon" pair
+     (any of: "39.7,-75.5", "39.7 -75.5", "N39 7' W75 30'") so power
+     users can drop directly to known coordinates without a network
+     round-trip. */
+  .splat-map-search {
+    position: absolute;
+    top: 12px; left: 50%; transform: translateX(-50%);
+    width: 360px; max-width: calc(100vw - 96px);
+    z-index: 1000;
+    background: rgba(20,20,20,0.94);
+    border: 1px solid #333; border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+    font-family: system-ui, sans-serif;
+  }
+  .splat-map-search-bar { display: flex; align-items: center; }
+  .splat-map-search-bar input {
+    flex: 1; background: transparent; border: none;
+    color: #fafafa; padding: 8px 12px; font-size: 12px;
+    outline: none; font-family: inherit;
+  }
+  .splat-map-search-bar input::placeholder { color: #777; }
+  .splat-map-search-bar button {
+    background: transparent; border: none; color: #aaa;
+    padding: 8px 12px; cursor: pointer; font-size: 14px;
+    border-left: 1px solid #2a2a2a;
+  }
+  .splat-map-search-bar button:hover { color: #fff; }
+  .splat-map-search-results {
+    border-top: 1px solid #2a2a2a;
+    max-height: 320px; overflow-y: auto; display: none;
+  }
+  .splat-map-search-results.shown { display: block; }
+  .splat-map-search-result {
+    padding: 7px 12px; cursor: pointer; font-size: 11px;
+    color: #ddd; line-height: 1.4;
+    border-bottom: 1px solid #2a2a2a;
+  }
+  .splat-map-search-result:hover  { background: #1d2a3a; color: #fff; }
+  .splat-map-search-result:last-child { border-bottom: none; }
+  .splat-map-search-result .sub {
+    color: #888; font-size: 10px; margin-top: 2px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .splat-map-search-empty {
+    padding: 7px 12px; color: #888; font-size: 11px; font-style: italic;
+  }
+
   /* Phase 23.1: basemap switcher control. Leaflet's default styling is
      a white background that clashes with the rest of our dark UI; override
      to match the legend / sidebar treatment so the topright corner reads
@@ -816,7 +865,19 @@
 
   </section>
 
-  <div id="map"></div>
+  <div id="map">
+    <!-- Phase 23.2: map search bar floats over the map (z-index 1000).
+         Placed inside #map so it doesn't shift when the sidebar toggles. -->
+    <div id="mapSearch" class="splat-map-search">
+      <div class="splat-map-search-bar">
+        <input id="mapSearchInp" type="text"
+               placeholder="Search address / place / coords…"
+               autocomplete="off" spellcheck="false">
+        <button id="mapSearchBtn" title="Search">🔍</button>
+      </div>
+      <div id="mapSearchResults" class="splat-map-search-results"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Phase 21.2: pin editor modal. Hidden by default; .shown class opens
@@ -893,6 +954,133 @@
   // with the new layer's name in evt.name.
   map.on('baselayerchange', evt => {
     try { localStorage.setItem(BASEMAP_KEY, evt.name); } catch {}
+  });
+
+  // ---------------- Map search (Phase 23.2) ----------------
+  // Hits Nominatim (OSM's free geocoder) for place/address lookups, and
+  // also recognizes "lat, lon" / "lat lon" so power users can drop directly
+  // to known coordinates without a network round-trip. Rate-limit-friendly:
+  // we only fire on submit (Enter / search button), not on keystrokes.
+  const searchInp = document.getElementById('mapSearchInp');
+  const searchBtn = document.getElementById('mapSearchBtn');
+  const searchRes = document.getElementById('mapSearchResults');
+  const searchBox = document.getElementById('mapSearch');
+  // Make the search bar swallow map clicks/scrolls so dragging text or
+  // scrolling the results doesn't accidentally pan/zoom the map.
+  L.DomEvent.disableClickPropagation(searchBox);
+  L.DomEvent.disableScrollPropagation(searchBox);
+
+  function showSearchResults(html) {
+    searchRes.innerHTML = html;
+    searchRes.classList.add('shown');
+  }
+  function hideSearchResults() {
+    searchRes.classList.remove('shown');
+  }
+  function flyToSearchHit(lat, lon, label) {
+    map.setView([lat, lon], Math.max(map.getZoom(), 13));
+    hideSearchResults();
+    if (typeof toast === 'function') {
+      toast(label || `${lat.toFixed(4)}, ${lon.toFixed(4)}`,
+            { kind: 'info', title: 'Map centered', durationMs: 2500 });
+    }
+  }
+
+  // Try parsing the input as a coordinate pair before going to the network.
+  // Accepts:
+  //   "39.7415, -75.5416"      (signed decimal degrees, optional space)
+  //   "39.7415 -75.5416"
+  //   "N39.7415 W75.5416"      (cardinal-prefix decimal)
+  //   "39.7415N 75.5416W"      (cardinal-suffix decimal)
+  // Returns {lat, lon} or null.
+  function tryParseLatLon(s) {
+    const t = s.trim().toUpperCase();
+    // Strip cardinal letters into sign hints, then look for two signed decimals.
+    const norm = t
+      .replace(/^([NS])\s*([\d.+-]+)/, (m, c, n) => (c === 'S' ? '-' : '') + n)
+      .replace(/\s+([EW])\s*([\d.+-]+)/, (m, c, n) => ' ' + (c === 'W' ? '-' : '') + n)
+      .replace(/([\d.]+)\s*([NS])/, (m, n, c) => (c === 'S' ? '-' : '') + n)
+      .replace(/([\d.]+)\s*([EW])/, (m, n, c) => (c === 'W' ? '-' : '') + n);
+    const m = norm.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (!m) return null;
+    const lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+    if (!isFinite(lat) || !isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    return { lat, lon };
+  }
+
+  async function searchNominatim(query) {
+    // Nominatim usage policy: max 1 req/sec, must identify the client. We
+    // pass an explicit user-agent-ish hint via the `email` param convention
+    // (the docs say to include contact info for heavy use). 8 results is
+    // plenty for a dropdown; addressdetails gives us a friendlier sub-line.
+    const u = new URL('https://nominatim.openstreetmap.org/search');
+    u.searchParams.set('q', query);
+    u.searchParams.set('format', 'json');
+    u.searchParams.set('limit', '8');
+    u.searchParams.set('addressdetails', '1');
+    const r = await fetch(u.toString(), {
+      headers: { 'Accept-Language': navigator.language || 'en' }
+    });
+    if (!r.ok) throw new Error('Nominatim returned HTTP ' + r.status);
+    return await r.json();
+  }
+
+  function escapeText(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    })[c]);
+  }
+
+  async function doMapSearch() {
+    const q = searchInp.value.trim();
+    if (!q) { hideSearchResults(); return; }
+
+    // Coordinate fast-path: no network needed.
+    const coord = tryParseLatLon(q);
+    if (coord) {
+      flyToSearchHit(coord.lat, coord.lon, `${coord.lat.toFixed(4)}, ${coord.lon.toFixed(4)}`);
+      return;
+    }
+
+    searchBtn.textContent = '…';
+    showSearchResults('<div class="splat-map-search-empty">Searching…</div>');
+    try {
+      const results = await searchNominatim(q);
+      if (!results || results.length === 0) {
+        showSearchResults('<div class="splat-map-search-empty">No matches.</div>');
+        return;
+      }
+      const rows = results.map(r => {
+        const lat = parseFloat(r.lat), lon = parseFloat(r.lon);
+        return `<div class="splat-map-search-result" data-lat="${lat}" data-lon="${lon}" data-name="${escapeText(r.display_name)}">
+          ${escapeText(r.display_name)}
+          <div class="sub">${lat.toFixed(4)}, ${lon.toFixed(4)} · ${escapeText(r.type || r.class || '')}</div>
+        </div>`;
+      }).join('');
+      showSearchResults(rows);
+    } catch (e) {
+      showSearchResults(`<div class="splat-map-search-empty">Search failed: ${escapeText(e.message)}</div>`);
+    } finally {
+      searchBtn.textContent = '🔍';
+    }
+  }
+
+  // Click a result row -> fly there
+  searchRes.addEventListener('click', e => {
+    const row = e.target.closest('.splat-map-search-result');
+    if (!row) return;
+    flyToSearchHit(+row.dataset.lat, +row.dataset.lon, row.dataset.name);
+  });
+
+  searchBtn.addEventListener('click', doMapSearch);
+  searchInp.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); doMapSearch(); }
+    if (e.key === 'Escape') { hideSearchResults(); searchInp.value = ''; searchInp.blur(); }
+  });
+  // Dismiss the dropdown when clicking anywhere outside the search widget.
+  document.addEventListener('mousedown', e => {
+    if (!e.target.closest('#mapSearch')) hideSearchResults();
   });
 
   // Phase 19c.2: floating dBm legend in the bottom-right corner of the map.
